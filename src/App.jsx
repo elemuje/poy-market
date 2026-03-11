@@ -1,5 +1,26 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
+/* ── Responsive breakpoint hook ───────────────────────────────────────── */
+function useBreakpoint() {
+  const [w, setW] = useState(() => typeof window !== "undefined" ? window.innerWidth : 1200);
+  useEffect(() => {
+    const handler = () => setW(window.innerWidth);
+    window.addEventListener("resize", handler);
+    return () => window.removeEventListener("resize", handler);
+  }, []);
+  return { isMobile: w < 640, isTablet: w < 1024, w };
+}
+
+/* ── Global mobile CSS ─────────────────────────────────────────────────── */
+const MOBILE_CSS = `
+  * { -webkit-tap-highlight-color: transparent; }
+  html { scroll-behavior: smooth; }
+  input, button, select, textarea { touch-action: manipulation; }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2840; border-radius: 4px; }
+`;
+
 /*
  ██████╗  ██████╗ ██╗   ██╗    ███╗   ███╗ █████╗ ██████╗ ██╗  ██╗███████╗████████╗
  ██╔══██╗██╔═══██╗╚██╗ ██╔╝    ████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔════╝╚══██╔══╝
@@ -636,13 +657,14 @@ function WalletModal({ onClose, onConnected }) {
   return (
     <div
       onClick={onClose}
-      style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(8,8,15,0.88)", backdropFilter: "blur(20px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+      style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(8,8,15,0.88)", backdropFilter: "blur(20px)", display: "flex", alignItems: typeof window !== "undefined" && window.innerWidth < 640 ? "flex-end" : "center", justifyContent: "center", padding: typeof window !== "undefined" && window.innerWidth < 640 ? 0 : 24 }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
           background: C.surface, border: `1px solid ${C.borderMid}`,
-          borderRadius: 24, width: "100%", maxWidth: 440,
+          borderRadius: typeof window !== "undefined" && window.innerWidth < 640 ? "20px 20px 0 0" : 24,
+          width: "100%", maxWidth: 440,
           boxShadow: `0 32px 80px #00000099`,
           animation: "mIn 0.25s cubic-bezier(0.34,1.56,0.64,1)",
           overflow: "hidden",
@@ -757,6 +779,7 @@ function NFTModal({ nft, onClose, wallet }) {
   const priceHist = usePriceHistory(nft.lastSale);
   const r = RARITY[nft.rarity] || RARITY.Common;
   const creator = CREATORS[nft.creator];
+  const { isMobile } = useBreakpoint();
 
   useEffect(() => {
     document.body.style.overflow = "hidden";
@@ -782,20 +805,22 @@ function NFTModal({ nft, onClose, wallet }) {
   return (
     <div
       onClick={onClose}
-      style={{ position: "fixed", inset: 0, zIndex: 1500, background: "rgba(8,8,15,0.9)", backdropFilter: "blur(20px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+      style={{ position: "fixed", inset: 0, zIndex: 1500, background: "rgba(8,8,15,0.9)", backdropFilter: "blur(20px)", display: "flex", alignItems: isMobile ? "flex-end" : "center", justifyContent: "center", padding: isMobile ? 0 : 24, overflowY: "auto" }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
           background: C.surface, border: `1px solid ${r.color}33`,
-          borderRadius: 28, maxWidth: 960, width: "100%", maxHeight: "90vh",
-          display: "grid", gridTemplateColumns: "1fr 1fr", overflow: "hidden",
+          borderRadius: isMobile ? "20px 20px 0 0" : 28,
+          maxWidth: isMobile ? "100%" : 960, width: "100%",
+          maxHeight: isMobile ? "92vh" : "90vh",
+          display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", overflow: "hidden",
           animation: "mIn 0.28s cubic-bezier(0.34,1.56,0.64,1)",
           boxShadow: `0 40px 100px #00000099, 0 0 0 1px ${r.color}18`,
         }}
       >
-        {/* Left panel */}
-        <div style={{ background: "#09090F", padding: 40, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, overflow: "auto" }}>
+        {/* Left panel — hidden on mobile */}
+        {!isMobile && <div style={{ background: "#09090F", padding: 40, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, overflow: "auto" }}>
           <div style={{ borderRadius: 20, overflow: "hidden", boxShadow: `0 0 60px ${r.glow}` }}>
             <NFTCanvas nft={nft} size={280} />
           </div>
@@ -817,14 +842,25 @@ function NFTModal({ nft, onClose, wallet }) {
               </div>
             ))}
           </div>
-        </div>
+        </div>}
 
-        {/* Right panel */}
-        <div style={{ padding: "28px 32px", overflow: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
-          <button
+        {/* Right panel — full width on mobile */}
+        <div style={{ padding: "20px clamp(16px,4vw,32px) calc(20px + env(safe-area-inset-bottom))", overflow: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* Mobile NFT preview */}
+          {isMobile && (
+            <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 4 }}>
+              <div style={{ borderRadius: 12, overflow: "hidden", flexShrink: 0 }}><NFTCanvas nft={nft} size={72} /></div>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 900, color: C.text }}>{nft.name} <span style={{ color: r.color }}>#{nft.num}</span></div>
+                <RarityBadge rarity={nft.rarity} tiny />
+              </div>
+              <button onClick={onClose} style={{ marginLeft: "auto", background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 32, height: 32, cursor: "pointer", color: C.muted, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>✕</button>
+            </div>
+          )}
+          {!isMobile && <button
             onClick={onClose}
             style={{ alignSelf: "flex-end", background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 30, height: 30, cursor: "pointer", color: C.muted, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}
-          >✕</button>
+          >✕</button>}
 
           {/* Creator row */}
           {creator && (
@@ -1129,59 +1165,106 @@ function NotifBell() {
 /* ── Top Nav ─────────────────────────────────────────────────────────────── */
 function Nav({ tab, setTab, wallet, onOpenWallet, onDisconnect }) {
   const [searchFocused, setSearchFocused] = useState(false);
-  const TABS = [["marketplace", "Marketplace"], ["my-nfts", "My NFTs"], ["activity", "Activity"], ["analytics", "Analytics"]];
+  const [menuOpen, setMenuOpen] = useState(false);
+  const { isMobile, isTablet } = useBreakpoint();
+  const TABS = [["marketplace", "🛒 Market"], ["my-nfts", "💼 My NFTs"], ["activity", "📋 Activity"], ["analytics", "📈 Analytics"]];
+  const TABS_DESKTOP = [["marketplace", "Marketplace"], ["my-nfts", "My NFTs"], ["activity", "Activity"], ["analytics", "Analytics"]];
 
   return (
-    <nav style={{ position: "sticky", top: 0, zIndex: 300, background: "rgba(8,8,15,0.94)", backdropFilter: "blur(28px)", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", padding: "0 28px", height: 66, gap: 0 }}>
-      {/* Logo */}
-      <div style={{ display: "flex", alignItems: "center", gap: 11, marginRight: 28, flexShrink: 0 }}>
-        <div style={{ width: 36, height: 36, borderRadius: 10, background: `linear-gradient(135deg, ${C.primary}, ${C.secondary})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17, boxShadow: `0 4px 18px ${C.primary}44` }}>⚡</div>
-        <div>
-          <div style={{ fontSize: 15, fontWeight: 900, letterSpacing: "-0.03em", color: C.text, lineHeight: 1 }}>PoY<span style={{ color: C.primary }}>Market</span></div>
-          <div style={{ fontSize: 8, color: C.muted, letterSpacing: "0.2em", textTransform: "uppercase" }}>Bitcoin NFTs</div>
-        </div>
-      </div>
-
-      {/* Search */}
-      <div style={{ position: "relative", width: 280, marginRight: 16 }}>
-        <input
-          placeholder="Search NFTs, creators…"
-          onFocus={() => setSearchFocused(true)}
-          onBlur={() => setSearchFocused(false)}
-          style={{ width: "100%", boxSizing: "border-box", background: searchFocused ? C.card : C.surface, border: `1px solid ${searchFocused ? C.primary + "66" : C.border}`, borderRadius: 30, padding: "8px 16px 8px 34px", color: C.text, fontSize: 13, fontFamily: "inherit", outline: "none", transition: "all 0.2s" }}
-        />
-        <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 14, pointerEvents: "none" }}>⌕</span>
-      </div>
-
-      {/* Tabs */}
-      <div style={{ display: "flex", flex: 1 }}>
-        {TABS.map(([id, label]) => (
-          <button key={id} onClick={() => setTab(id)} style={{ background: "none", border: "none", borderBottom: tab === id ? `2px solid ${C.primary}` : "2px solid transparent", padding: "0 16px", height: 66, color: tab === id ? C.primary : C.muted, fontWeight: tab === id ? 700 : 400, fontSize: 13, cursor: "pointer", fontFamily: "inherit", transition: "color 0.18s", whiteSpace: "nowrap" }}>
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {/* Right */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <NotifBell />
-        {wallet ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, background: C.card, border: `1px solid ${C.primary}44`, borderRadius: 30, padding: "6px 14px", cursor: "pointer" }}
-            onClick={onDisconnect}
-            title="Click to disconnect"
-          >
-            <span style={{ fontSize: 14 }}>{wallet.walletIcon}</span>
-            <div style={{ width: 7, height: 7, borderRadius: "50%", background: C.success, boxShadow: `0 0 7px ${C.success}` }} />
-            <Mono size={12} color={C.text}>{wallet.address.slice(0, 8)}…{wallet.address.slice(-4)}</Mono>
-            <Mono size={10} color={C.muted}>{wallet.walletName}</Mono>
+    <>
+      <nav style={{ position: "sticky", top: 0, zIndex: 300, background: "rgba(8,8,15,0.96)", backdropFilter: "blur(28px)", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", padding: isMobile ? "0 16px" : "0 28px", height: 60, gap: 0 }}>
+        {/* Logo */}
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginRight: isMobile ? "auto" : 28, flexShrink: 0 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 9, background: `linear-gradient(135deg, ${C.primary}, ${C.secondary})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, boxShadow: `0 4px 18px ${C.primary}44` }}>⚡</div>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 900, letterSpacing: "-0.03em", color: C.text, lineHeight: 1 }}>PoY<span style={{ color: C.primary }}>Market</span></div>
+            {!isMobile && <div style={{ fontSize: 8, color: C.muted, letterSpacing: "0.2em", textTransform: "uppercase" }}>Bitcoin NFTs</div>}
           </div>
-        ) : (
-          <button onClick={onOpenWallet} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: "9px 20px", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "inherit", boxShadow: `0 4px 18px ${C.primary}44` }}>
-            Connect Wallet
-          </button>
+        </div>
+
+        {/* Search — hidden on mobile */}
+        {!isMobile && (
+          <div style={{ position: "relative", width: isTablet ? 180 : 280, marginRight: 16, flexShrink: 0 }}>
+            <input
+              placeholder="Search NFTs, creators…"
+              onFocus={() => setSearchFocused(true)}
+              onBlur={() => setSearchFocused(false)}
+              style={{ width: "100%", boxSizing: "border-box", background: searchFocused ? C.card : C.surface, border: `1px solid ${searchFocused ? C.primary + "66" : C.border}`, borderRadius: 30, padding: "8px 16px 8px 34px", color: C.text, fontSize: 13, fontFamily: "inherit", outline: "none", transition: "all 0.2s" }}
+            />
+            <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 14, pointerEvents: "none" }}>⌕</span>
+          </div>
         )}
-      </div>
-    </nav>
+
+        {/* Desktop tabs */}
+        {!isMobile && (
+          <div style={{ display: "flex", flex: 1 }}>
+            {TABS_DESKTOP.map(([id, label]) => (
+              <button key={id} onClick={() => setTab(id)} style={{ background: "none", border: "none", borderBottom: tab === id ? `2px solid ${C.primary}` : "2px solid transparent", padding: "0 14px", height: 60, color: tab === id ? C.primary : C.muted, fontWeight: tab === id ? 700 : 400, fontSize: 13, cursor: "pointer", fontFamily: "inherit", transition: "color 0.18s", whiteSpace: "nowrap" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Right */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {!isMobile && <NotifBell />}
+          {wallet ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 7, background: C.card, border: `1px solid ${C.primary}44`, borderRadius: 30, padding: isMobile ? "6px 10px" : "6px 14px", cursor: "pointer" }}
+              onClick={onDisconnect} title="Click to disconnect"
+            >
+              <span style={{ fontSize: 14 }}>{wallet.walletIcon}</span>
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.success, boxShadow: `0 0 6px ${C.success}` }} />
+              {!isMobile && <Mono size={12} color={C.text}>{wallet.address.slice(0, 6)}…{wallet.address.slice(-4)}</Mono>}
+            </div>
+          ) : (
+            <button onClick={onOpenWallet} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: isMobile ? "8px 14px" : "9px 20px", color: "#fff", fontWeight: 700, fontSize: isMobile ? 12 : 13, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+              {isMobile ? "Connect" : "Connect Wallet"}
+            </button>
+          )}
+          {/* Hamburger */}
+          {isMobile && (
+            <button onClick={() => setMenuOpen(o => !o)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 9, width: 38, height: 38, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 5, flexShrink: 0 }}>
+              <div style={{ width: 18, height: 2, background: menuOpen ? C.primary : C.muted, borderRadius: 2, transform: menuOpen ? "rotate(45deg) translate(5px,5px)" : "none", transition: "all 0.2s" }} />
+              <div style={{ width: 18, height: 2, background: menuOpen ? C.primary : C.muted, borderRadius: 2, opacity: menuOpen ? 0 : 1, transition: "all 0.2s" }} />
+              <div style={{ width: 18, height: 2, background: menuOpen ? C.primary : C.muted, borderRadius: 2, transform: menuOpen ? "rotate(-45deg) translate(5px,-5px)" : "none", transition: "all 0.2s" }} />
+            </button>
+          )}
+        </div>
+      </nav>
+
+      {/* Mobile slide-down menu */}
+      {isMobile && menuOpen && (
+        <div style={{ position: "sticky", top: 60, zIndex: 299, background: "rgba(8,8,15,0.98)", backdropFilter: "blur(28px)", borderBottom: `1px solid ${C.border}`, padding: "8px 16px 16px", animation: "mIn 0.2s ease" }}>
+          {/* Mobile search */}
+          <div style={{ position: "relative", marginBottom: 12 }}>
+            <input placeholder="Search NFTs, creators…" style={{ width: "100%", boxSizing: "border-box", background: C.card, border: `1px solid ${C.border}`, borderRadius: 30, padding: "10px 16px 10px 36px", color: C.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 15, pointerEvents: "none" }}>⌕</span>
+          </div>
+          {/* Tab buttons */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            {TABS.map(([id, label]) => (
+              <button key={id} onClick={() => { setTab(id); setMenuOpen(false); }} style={{ background: tab === id ? `${C.primary}18` : C.card, border: `1px solid ${tab === id ? C.primary + "55" : C.border}`, borderRadius: 12, padding: "12px 8px", color: tab === id ? C.primary : C.muted, fontWeight: tab === id ? 700 : 500, fontSize: 13, cursor: "pointer", fontFamily: "inherit", textAlign: "center" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Mobile bottom tab bar */}
+      {isMobile && (
+        <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 400, background: "rgba(8,8,15,0.97)", backdropFilter: "blur(28px)", borderTop: `1px solid ${C.border}`, display: "flex", padding: "8px 0 calc(8px + env(safe-area-inset-bottom))" }}>
+          {[["marketplace","🛒","Market"],["my-nfts","💼","NFTs"],["activity","📋","Activity"],["analytics","📈","Stats"]].map(([id,icon,label]) => (
+            <button key={id} onClick={() => { setTab(id); setMenuOpen(false); }} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "4px 0" }}>
+              <span style={{ fontSize: 20 }}>{icon}</span>
+              <span style={{ fontSize: 10, fontWeight: tab === id ? 700 : 400, color: tab === id ? C.primary : C.muted }}>{label}</span>
+              {tab === id && <div style={{ width: 20, height: 2, borderRadius: 1, background: C.primary }} />}
+            </button>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1190,6 +1273,7 @@ function Hero({ onExplore }) {
   const [tick, setTick] = useState(0);
   const [fi, setFi] = useState(0);
   const featured = [NFTS[7], NFTS[3], NFTS[0]];
+  const { isMobile, isTablet } = useBreakpoint();
 
   useEffect(() => {
     const t1 = setInterval(() => setTick((x) => x + 1), 50);
@@ -1198,7 +1282,7 @@ function Hero({ onExplore }) {
   }, []);
 
   return (
-    <div style={{ position: "relative", borderRadius: 24, overflow: "hidden", border: `1px solid ${C.border}`, minHeight: 360, display: "flex", marginBottom: 24 }}>
+    <div style={{ position: "relative", borderRadius: isMobile ? 16 : 24, overflow: "hidden", border: `1px solid ${C.border}`, minHeight: isMobile ? 280 : 360, display: "flex", flexDirection: isMobile ? "column" : "row", marginBottom: 20 }}>
       <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0.12 }} preserveAspectRatio="none">
         <defs>
           <radialGradient id="hg1" cx="25%" cy="50%"><stop offset="0%" stopColor={C.primary} /><stop offset="100%" stopColor="transparent" /></radialGradient>
@@ -1209,8 +1293,8 @@ function Hero({ onExplore }) {
         <rect width="100%" height="100%" fill="url(#hg2)" />
       </svg>
 
-      {/* Floating particles */}
-      {Array.from({ length: 6 }, (_, i) => {
+      {/* Floating particles — fewer on mobile */}
+      {Array.from({ length: isMobile ? 3 : 6 }, (_, i) => {
         const ox = 55 + 32 * Math.cos(tick * 0.007 + i * 1.1);
         const oy = 30 + 25 * Math.sin(tick * 0.005 + i * 0.5);
         return (
@@ -1218,48 +1302,51 @@ function Hero({ onExplore }) {
         );
       })}
 
-      <div style={{ flex: 1, padding: "48px 52px", display: "flex", flexDirection: "column", justifyContent: "center", position: "relative", zIndex: 1 }}>
-        <div style={{ display: "inline-flex", gap: 8, alignItems: "center", marginBottom: 16, background: `${C.primary}15`, border: `1px solid ${C.primary}30`, borderRadius: 30, padding: "5px 14px", alignSelf: "flex-start" }}>
+      <div style={{ flex: 1, padding: isMobile ? "28px 20px 24px" : "48px 52px", display: "flex", flexDirection: "column", justifyContent: "center", position: "relative", zIndex: 1 }}>
+        <div style={{ display: "inline-flex", gap: 8, alignItems: "center", marginBottom: 14, background: `${C.primary}15`, border: `1px solid ${C.primary}30`, borderRadius: 30, padding: "5px 12px", alignSelf: "flex-start" }}>
           <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.success, boxShadow: `0 0 8px ${C.success}` }} />
           <Mono size={10} color={C.primary} weight={700}>927 LIVE LISTINGS</Mono>
         </div>
-        <h1 style={{ fontSize: 46, fontWeight: 900, lineHeight: 1.08, letterSpacing: "-0.04em", margin: "0 0 16px", color: C.text }}>
+        <h1 style={{ fontSize: isMobile ? 30 : 46, fontWeight: 900, lineHeight: 1.1, letterSpacing: "-0.04em", margin: "0 0 12px", color: C.text }}>
           The Only<br />
           <span style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.accent} 40%, ${C.secondary})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Bitcoin-Yield</span><br />
           NFT Market
         </h1>
-        <p style={{ fontSize: 15, color: C.muted, lineHeight: 1.75, maxWidth: 400, margin: "0 0 28px" }}>
+        <p style={{ fontSize: isMobile ? 13 : 15, color: C.muted, lineHeight: 1.7, maxWidth: 400, margin: "0 0 22px" }}>
           Trade Proof-of-Yield receipts backed by OP_NET mining rewards. Every NFT earns real Bitcoin.
         </p>
-        <div style={{ display: "flex", gap: 12 }}>
-          <button onClick={onExplore} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: "13px 28px", color: "#fff", fontWeight: 800, fontSize: 15, cursor: "pointer", fontFamily: "inherit", boxShadow: `0 8px 28px ${C.primary}44` }}>Explore Market</button>
-          <button style={{ background: "transparent", border: `1px solid ${C.borderMid}`, borderRadius: 30, padding: "13px 24px", color: C.text, fontWeight: 600, fontSize: 15, cursor: "pointer", fontFamily: "inherit" }}>Mint Yield NFT</button>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button onClick={onExplore} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: isMobile ? "11px 22px" : "13px 28px", color: "#fff", fontWeight: 800, fontSize: isMobile ? 13 : 15, cursor: "pointer", fontFamily: "inherit", boxShadow: `0 8px 28px ${C.primary}44` }}>Explore Market</button>
+          <button style={{ background: "transparent", border: `1px solid ${C.borderMid}`, borderRadius: 30, padding: isMobile ? "11px 18px" : "13px 24px", color: C.text, fontWeight: 600, fontSize: isMobile ? 13 : 15, cursor: "pointer", fontFamily: "inherit" }}>Mint Yield NFT</button>
         </div>
-        <div style={{ display: "flex", gap: 28, marginTop: 34 }}>
+        <div style={{ display: "flex", gap: isMobile ? 18 : 28, marginTop: 24, flexWrap: "wrap" }}>
           {[["142.8 BTC", "Total Volume"], ["4,291", "NFTs Minted"], ["1,843", "Owners"]].map(([v, l]) => (
             <div key={l}>
-              <div style={{ fontSize: 20, fontWeight: 800, fontFamily: "'JetBrains Mono', monospace", color: C.text }}>{v}</div>
-              <div style={{ fontSize: 11, color: C.muted }}>{l}</div>
+              <div style={{ fontSize: isMobile ? 16 : 20, fontWeight: 800, fontFamily: "'JetBrains Mono', monospace", color: C.text }}>{v}</div>
+              <div style={{ fontSize: 10, color: C.muted }}>{l}</div>
             </div>
           ))}
         </div>
       </div>
 
-      <div style={{ width: 280, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 28, gap: 14, position: "relative", zIndex: 1 }}>
-        <Mono size={10} color={C.muted} weight={700} style={{ letterSpacing: "0.14em" }}>FEATURED</Mono>
-        <div style={{ borderRadius: 18, overflow: "hidden", boxShadow: `0 0 48px ${RARITY[featured[fi].rarity].glow}` }}>
-          <NFTCanvas nft={featured[fi]} size={190} />
+      {/* Featured panel — hidden on mobile */}
+      {!isMobile && (
+        <div style={{ width: isTablet ? 220 : 280, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 28, gap: 14, position: "relative", zIndex: 1 }}>
+          <Mono size={10} color={C.muted} weight={700} style={{ letterSpacing: "0.14em" }}>FEATURED</Mono>
+          <div style={{ borderRadius: 18, overflow: "hidden", boxShadow: `0 0 48px ${RARITY[featured[fi].rarity].glow}` }}>
+            <NFTCanvas nft={featured[fi]} size={isTablet ? 150 : 190} />
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{featured[fi].name} #{featured[fi].num}</div>
+            <BtcPrice value={featured[fi].price} size={13} />
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[0, 1, 2].map((i) => (
+              <button key={i} onClick={() => setFi(i)} style={{ width: i === fi ? 18 : 6, height: 6, borderRadius: 3, background: i === fi ? C.primary : C.dim, border: "none", cursor: "pointer", transition: "all 0.3s", padding: 0 }} />
+            ))}
+          </div>
         </div>
-        <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{featured[fi].name} #{featured[fi].num}</div>
-          <BtcPrice value={featured[fi].price} size={13} />
-        </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          {[0, 1, 2].map((i) => (
-            <button key={i} onClick={() => setFi(i)} style={{ width: i === fi ? 18 : 6, height: 6, borderRadius: 3, background: i === fi ? C.primary : C.dim, border: "none", cursor: "pointer", transition: "all 0.3s", padding: 0 }} />
-          ))}
-        </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -1365,7 +1452,7 @@ function AboutSection() {
         background: `linear-gradient(135deg, ${C.primary}08, ${C.secondary}08)`,
         border: `1px solid ${C.border}`,
         borderRadius: 20,
-        padding: "36px 36px 32px",
+        padding: "clamp(20px,4vw,36px) clamp(16px,3vw,36px) clamp(18px,3vw,32px)",
       }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: C.primary, letterSpacing: "0.12em", fontFamily: "'JetBrains Mono', monospace", marginBottom: 10 }}>
           HOW IT WORKS
@@ -1538,7 +1625,7 @@ function MarketTab({ onOpen, recentlyViewed }) {
       <Hero onExplore={() => exploreRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })} />
 
       {/* Stats grid */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 1, background: C.border, borderRadius: 18, overflow: "hidden", marginBottom: 28 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 1, background: C.border, borderRadius: 14, overflow: "hidden", marginBottom: 20 }}>
         {[["Total Volume","142.8 BTC","+8.2%",true],["Floor","₿0.004","+2.1%",true],["24h Sales","34","+12",true],["Listed","28.4%","-1.2%",false],["Owners","1,843","+34",true],["Avg APY","17.3%","+0.9%",true]].map(([l,v,d,pos]) => (
           <div key={l} style={{ background: C.surface, padding: "15px 16px", textAlign: "center" }}>
             <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.07em", marginBottom: 4 }}>{l}</div>
@@ -1831,9 +1918,9 @@ function Footer() {
   };
 
   return (
-    <footer style={{ background: C.surface, borderTop: `1px solid ${C.border}`, marginTop: 80 }}>
+    <footer style={{ background: C.surface, borderTop: `1px solid ${C.border}`, marginTop: 80, paddingBottom: "env(safe-area-inset-bottom)" }}>
       {/* Main footer grid */}
-      <div style={{ maxWidth: 1320, margin: "0 auto", padding: "60px 32px 40px", display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 40 }}>
+      <div style={{ maxWidth: 1320, margin: "0 auto", padding: "clamp(28px,5vw,60px) clamp(16px,3vw,32px) 32px", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "clamp(20px,3vw,40px)" }}>
         {/* Brand */}
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 11, marginBottom: 16 }}>
@@ -1905,7 +1992,7 @@ function Footer() {
 
       {/* Bottom bar */}
       <div style={{ borderTop: `1px solid ${C.border}` }}>
-        <div style={{ maxWidth: 1320, margin: "0 auto", padding: "18px 32px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+        <div style={{ maxWidth: 1320, margin: "0 auto", padding: "16px clamp(16px,3vw,32px)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
           <Mono size={12} color={C.muted}>© 2026 PoYMarket. Built on OP_NET · Bitcoin Layer 2. All rights reserved.</Mono>
           <div style={{ display: "flex", gap: 20 }}>
             {["Privacy Policy", "Terms of Service", "Cookie Policy"].map((l) => (
@@ -1993,6 +2080,7 @@ function Toast({ toasts }) {
 
 /* ── Root App ────────────────────────────────────────────────────────────── */
 export default function App() {
+  const { isMobile } = useBreakpoint();
   const [tab,            setTab]           = useState("marketplace");
   const [modal,          setModal]         = useState(null);
   const [walletModal,    setWalletModal]   = useState(false);
@@ -2044,14 +2132,26 @@ export default function App() {
           from { opacity: 0; transform: scale(0.94) translateY(8px); }
           to   { opacity: 1; transform: scale(1)    translateY(0);   }
         }
+        @keyframes slideUp {
+          from { opacity: 0; transform: translateY(20px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
         @keyframes spin {
           from { transform: rotate(0deg);   }
           to   { transform: rotate(360deg); }
         }
+        @media (max-width: 639px) {
+          * { cursor: auto !important; }
+          .desktop-only { display: none !important; }
+        }
+        @media (min-width: 640px) {
+          .mobile-only { display: none !important; }
+        }
+        ${MOBILE_CSS}
       `}</style>
 
-      <NoiseOverlay />
-      <Cursor />
+      {!isMobile && <NoiseOverlay />}
+      {!isMobile && <Cursor />}
 
       {/* Ambient glow */}
       <div style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0, background: `radial-gradient(ellipse 60% 40% at 12% 15%, ${C.primary}06, transparent 55%), radial-gradient(ellipse 50% 50% at 88% 85%, ${C.secondary}06, transparent 55%)` }} />
@@ -2066,7 +2166,7 @@ export default function App() {
           onDisconnect={handleDisconnect}
         />
 
-        <main style={{ maxWidth: 1320, margin: "0 auto", padding: "40px 32px 60px" }}>
+        <main style={{ maxWidth: 1320, margin: "0 auto", padding: `clamp(16px,4vw,40px) clamp(12px,3vw,32px) ${isMobile ? "100px" : "60px"}` }}>
           {tab === "marketplace" && <MarketTab onOpen={handleOpenNFT} recentlyViewed={recentlyViewed} />}
           {tab === "my-nfts"    && <MyNFTsTab wallet={wallet} onOpenWallet={() => setWalletModal(true)} onOpen={handleOpenNFT} />}
           {tab === "activity"   && <ActivityTab />}
