@@ -26,9 +26,14 @@
 // ── Contract address ──────────────────────────────────────────────────────────
 // Set VITE_CONTRACT_ADDRESS in your .env or Vercel dashboard.
 // Falls back to the v6 testnet address for local dev.
-export const CONTRACT_ADDRESS =
-  (typeof import.meta !== "undefined" && import.meta.env?.VITE_CONTRACT_ADDRESS) ||
-  "opt1sqzphaeuz4yn6fmhext577zypkg6uyemtwsvgjuvc";
+// CONTRACT_ADDRESS is injected by Vite at build time from VITE_CONTRACT_ADDRESS env var.
+// Using a function call defers evaluation so Rollup does not try to statically analyse
+// import.meta at module parse time (which breaks in some Rollup/esbuild pipelines).
+function _getContractAddress() {
+  try { return import.meta.env.VITE_CONTRACT_ADDRESS || "opt1sqzphaeuz4yn6fmhext577zypkg6uyemtwsvgjuvc"; }
+  catch { return "opt1sqzphaeuz4yn6fmhext577zypkg6uyemtwsvgjuvc"; }
+}
+export const CONTRACT_ADDRESS = _getContractAddress();
 
 // ── Selector table ────────────────────────────────────────────────────────────
 // Pre-computed selectors for every PoYMarket public method.

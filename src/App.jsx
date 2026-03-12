@@ -35,7 +35,7 @@ const MOBILE_CSS = `
 `;
 
 /* ── Backend API base ────────────────────────────────────────────────────── */
-const API_BASE = (typeof import !== "undefined" && typeof import.meta !== "undefined" && import.meta.env?.VITE_API_BASE) || "http://localhost:3001";
+const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) || "http://localhost:3001";
 
 /* ── Contract TX helper ──────────────────────────────────────────────────── */
 // 1. Encodes calldata via the PoYMarket backend (contract address stays server-side)

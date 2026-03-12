@@ -5,6 +5,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   build: {
+    target: 'es2020',       // Required for BigInt literals (5000n etc.)
     outDir: 'dist',
     sourcemap: false,
     rollupOptions: {
@@ -14,6 +15,9 @@ export default defineConfig({
         },
       },
     },
+  },
+  esbuild: {
+    target: 'es2020',       // Match esbuild transform target
   },
   server: {
     port: 5173,
