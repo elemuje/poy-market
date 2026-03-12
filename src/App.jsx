@@ -1,4 +1,17 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import {
+  CONTRACT_ADDRESS,
+  callContract,
+  sendBTC,
+  encodeMint,
+  encodeTransfer,
+  encodeList,
+  encodeDelist,
+  encodeApproveBuyer,
+  encodeBuyNFT,
+  encodePlaceOffer,
+  encodeClaimYield,
+} from "./opnet-calldata.js";
 
 /* ── Responsive breakpoint hook ───────────────────────────────────────── */
 function useBreakpoint() {
@@ -27,18 +40,64 @@ const API_BASE = (typeof import !== "undefined" && typeof import.meta !== "undef
 /* ── Contract TX helper ──────────────────────────────────────────────────── */
 // 1. Encodes calldata via the PoYMarket backend (contract address stays server-side)
 // 2. Asks the connected wallet to sign + broadcast the OP_NET interaction
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_NET transaction signing — correct patterns per official @btc-vision libs
 //
-// OP_NET transaction model:
-//   - OP_WALLET:  w.signInteraction({ to, calldata })  → returns signed psbt + vout → then w.broadcastTransaction(signed)
-//   - UniSat:     window.unisat.signPsbt(psbtHex)      → returns signedPsbtHex → window.unisat.pushPsbt(signedPsbtHex)
-//   - OKX:        window.okxwallet.bitcoin.signPsbt(psbtHex) → then pushPsbt
-//   - Leather:    LeatherProvider.request("signPsbt", {...})  → then broadcastTransaction
+// The RIGHT way to call OP_WALLET (from @btc-vision/walletconnect README):
+//   walletInstance.sendTransaction({ to, calldata, priorityFee })
+//   → walletInstance is the raw provider returned by useWalletConnect()
+//   → It handles UTXOs, PSBT construction, signing, and broadcasting internally
 //
-// Backend returns:  { psbt: "<hex>", to: "<contractAddr>", calldata: "<hex>" }
-// Demo mode (backend offline): simulates the full flow with fake responses.
+// For UniSat / OKX / Leather:
+//   Backend returns a pre-built PSBT hex → wallet signs it → wallet pushes it
+//
+// Backend returns: { psbt?: "<hex>", to: "<contractAddr>", calldata: "<hex>" }
+// Demo mode (backend offline): returns a fake txHash after 1.2s.
+// ─────────────────────────────────────────────────────────────────────────────
 
+// ── Calldata builders: map each UI action to the right encoder ────────────────
+// Returns hex calldata using the pure-JS opnet-calldata.js encoder (no backend).
+function buildCalldata(endpoint, body) {
+  switch (endpoint) {
+    case "mint":         return encodeMint(body.stakedAmount);
+    case "transfer":     return encodeTransfer(body.tokenId, body.to);
+    case "list":         return encodeList(body.tokenId, body.priceSats);
+    case "delist":       return encodeDelist(body.tokenId);
+    case "approve-buyer":return encodeApproveBuyer(body.tokenId, body.buyer);
+    case "buy":          return encodeBuyNFT(body.tokenId, body.seller);
+    case "offer":        return encodePlaceOffer(body.tokenId, body.offerSats);
+    case "claim":        return encodeClaimYield(body.tokenId);
+    default:
+      throw new Error(`Unknown PoYMarket endpoint: ${endpoint}`);
+  }
+}
+
+// ── sendContractTx — Hybrid: direct calldata path (OP_WALLET) + backend fallback
+//
+// For OP_WALLET:   Builds calldata client-side → sends via window.opnet.sendTransaction()
+//                  NO backend required. Works fully offline / without a server.
+//
+// For UniSat/OKX:  Falls back to backend for PSBT construction (they need pre-built PSBTs).
+//                  Backend VITE_API_BASE must be set. If backend is offline → demo mode.
+// ─────────────────────────────────────────────────────────────────────────────
 async function sendContractTx(endpoint, body, walletInfo) {
-  // ── Step 1: encode calldata via backend ──────────────────────────────────
+  const { walletId, address, instance } = walletInfo ?? {};
+
+  // ── OP_WALLET: encode calldata in-browser, send directly ─────────────────
+  if (walletId === "op_wallet") {
+    let calldata;
+    try {
+      calldata = buildCalldata(endpoint, body);
+    } catch (encErr) {
+      // encoding error (e.g. bad address) — surface to user
+      throw new Error(`Calldata encoding failed: ${encErr.message}`);
+    }
+
+    return callContract(calldata, walletInfo, 5000n);
+  }
+
+  // ── Other wallets (UniSat, OKX, Leather): need backend PSBT ──────────────
+  // Try backend first, fall back to demo mode if offline.
   let txData;
   try {
     const res = await fetch(`${API_BASE}/api/encode/${endpoint}`, {
@@ -50,87 +109,44 @@ async function sendContractTx(endpoint, body, walletInfo) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Server error ${res.status}`);
     }
-    txData = await res.json(); // { psbt?, to, calldata }
+    txData = await res.json();
   } catch (e) {
     console.warn("[PoYMarket] Backend offline — demo mode:", e.message);
-    // Demo mode: create a fake transaction that resolves immediately
-    return new Promise((resolve) => {
-      setTimeout(() => resolve({ txHash: "demo_" + Math.random().toString(16).slice(2, 10), demo: true }), 1200);
-    });
+    return new Promise((r) =>
+      setTimeout(() => r({ txHash: "demo_" + Math.random().toString(16).slice(2, 10), demo: true }), 1200)
+    );
   }
 
-  // ── Step 2: sign & broadcast via wallet ──────────────────────────────────
-  const { walletId, address } = walletInfo;
-  const psbtHex    = txData.psbt     || "";
-  const calldata   = txData.calldata || "";
-  const contractTo = txData.to       || "";
+  const psbtHex = txData.psbt || "";
 
-  // OP_WALLET (native OP_NET support — recommended)
-  if (walletId === "op_wallet") {
-    const w = window.opnet || window.op_wallet;
-    if (!w) throw new Error("OP_WALLET extension not found. Please install it.");
-    // Try native signInteraction first (OP_NET interaction API)
-    if (w.signInteraction) {
-      const signed = await w.signInteraction({ to: contractTo, calldata });
-      if (w.broadcastTransaction) return w.broadcastTransaction(signed);
-      if (w.broadcast)            return w.broadcast(signed);
-    }
-    // Fallback: PSBT flow
-    if (psbtHex && w.signPsbt) {
-      const signedPsbt = await w.signPsbt(psbtHex);
-      return w.pushPsbt?.(signedPsbt) ?? w.broadcastTransaction?.(signedPsbt) ?? { txHash: signedPsbt };
-    }
-    // Last resort: generic sendTransaction
-    if (w.sendTransaction) return w.sendTransaction({ to: contractTo, data: calldata, from: address });
-    throw new Error("OP_WALLET version too old — please update your wallet extension.");
-  }
-
-  // UniSat
   if (walletId === "unisat") {
     const w = window.unisat;
     if (!w) throw new Error("UniSat extension not found.");
-    if (psbtHex) {
-      const signed = await w.signPsbt(psbtHex, {
-        autoFinalized: true,
-        toSignInputs: [{ index: 0, address }],
-      });
-      const txid = await w.pushPsbt(signed);
-      return { txHash: txid };
-    }
-    // Fallback: signMessage to record intent
-    const sig = await w.signMessage(JSON.stringify({ to: contractTo, calldata }));
-    return { txHash: sig?.slice(0, 32) ?? "unisat_" + Date.now() };
+    if (!psbtHex) throw new Error("No PSBT from backend for UniSat signing.");
+    const signed = await w.signPsbt(psbtHex, { autoFinalized: true, toSignInputs: [{ index: 0, address }] });
+    const txid   = await w.pushPsbt(signed);
+    return { txHash: txid };
   }
 
-  // OKX Wallet
   if (walletId === "okx") {
     const w = window.okxwallet?.bitcoin || window.okxwallet;
     if (!w) throw new Error("OKX Wallet extension not found.");
-    if (psbtHex && w.signPsbt) {
-      const signed = await w.signPsbt(psbtHex);
-      const txid   = await w.pushPsbt(signed);
-      return { txHash: txid };
-    }
-    const sig = await w.signMessage?.(JSON.stringify({ to: contractTo, calldata }), address);
-    return { txHash: sig?.slice(0, 32) ?? "okx_" + Date.now() };
+    const signed = await w.signPsbt(psbtHex, { autoFinalized: true });
+    const txid   = await w.pushPsbt(signed);
+    return { txHash: txid };
   }
 
-  // Leather
   if (walletId === "leather") {
     const w = window.LeatherProvider || window.HiroWalletProvider;
     if (!w) throw new Error("Leather extension not found.");
-    if (psbtHex) {
-      const result = await w.request("signPsbt", { hex: psbtHex, broadcast: true });
-      return { txHash: result?.result?.txid ?? result?.txid ?? "leather_" + Date.now() };
-    }
-    const result = await w.request("stx_signMessage", { message: JSON.stringify({ to: contractTo, calldata }) });
-    return { txHash: result?.result?.signature?.slice(0, 32) ?? "leather_" + Date.now() };
+    const result = await w.request("signPsbt", { hex: psbtHex, broadcast: true });
+    return { txHash: result?.result?.txid ?? result?.txid ?? "leather_" + Date.now() };
   }
 
   // Unknown wallet — demo fallback
-  return new Promise((resolve) => {
-    setTimeout(() => resolve({ txHash: "wallet_" + Date.now() }), 800);
-  });
+  return new Promise((r) =>
+    setTimeout(() => r({ txHash: "wallet_" + Date.now(), demo: true }), 800)
+  );
 }
 
 
@@ -191,7 +207,7 @@ const WALLETS = [
       const accounts = await w.requestAccounts();
       const pubkey   = await w.getPublicKey();
       const chain    = await w.getChain?.() || { network: "mainnet" };
-      return { address: accounts[0], publicKey: pubkey, network: chain.network || "mainnet" };
+      return { address: accounts[0], publicKey: pubkey, network: chain.network || "mainnet", instance: w };
     },
   },
   {
@@ -741,6 +757,7 @@ function WalletModal({ onClose, onConnected }) {
         walletName: wallet.label,
         walletIcon: wallet.icon,
         walletColor: wallet.color,
+        instance:  result.instance  || null,  // raw provider for sendContractTx
       });
       onClose();
     } catch (err) {
@@ -927,39 +944,24 @@ function NFTModal({ nft, onClose, wallet, onOpenWallet, onToast }) {
     if (!wallet) { onOpenWallet?.(); return; }
 
     // PoY Market — verify-don't-custody purchase flow:
-    //   Step 1 — buyer sends BTC to seller's Bitcoin address (prompts wallet)
-    //   Step 2 — seller confirms receipt off-chain and calls approveBuyer on-chain
-    //   Step 3 — buyer calls buyNFT on-chain (ownership transfers)
+    //   Step 1 — buyer sends BTC directly to seller's Bitcoin address (no contract involved)
+    //   Step 2 — seller sees payment on-chain → calls approveBuyer(tokenId, buyerAddress)
+    //   Step 3 — buyer calls buyNFT(tokenId, sellerAddress) → ownership transfers on OP_NET
     //
-    // Here we handle Step 1 (BTC send) and show the user what to expect next.
+    // This function handles Step 1 (BTC send via OP_WALLET's sendBitcoin API).
 
     setTxState("pending");
-    setTxMsg("Confirm BTC payment in your wallet…");
+    setTxMsg("Sending tBTC to seller — confirm in OP_WALLET…");
 
     const satAmount  = Math.round(nft.price * 1e8);
     const sellerAddr = nft.owner;
 
     try {
-      let txid;
-
-      // Try wallet-native sendBitcoin
-      const opw = window.opnet || window.op_wallet;
-      const uni  = window.unisat;
-      const okx  = window.okxwallet?.bitcoin || window.okxwallet;
-
-      if (wallet.walletId === "unisat" && uni?.sendBitcoin) {
-        txid = await uni.sendBitcoin(sellerAddr, satAmount);
-      } else if (wallet.walletId === "op_wallet" && opw?.sendBitcoin) {
-        txid = await opw.sendBitcoin(sellerAddr, satAmount);
-      } else if (wallet.walletId === "okx" && okx?.sendBitcoin) {
-        txid = await okx.sendBitcoin(sellerAddr, satAmount);
-      } else {
-        // Wallets without sendBitcoin (Leather, older versions) — fall through to demo
-        throw new Error("__demo__");
-      }
+      // Use the imported sendBTC helper — handles OP_WALLET, UniSat, OKX
+      const { txHash: txid } = await sendBTC(sellerAddr, satAmount, wallet);
 
       const shortTx = typeof txid === "string" ? txid.slice(0, 12) + "…" : "confirmed";
-      setTxMsg(`✓ Payment sent (${shortTx}) — Awaiting seller approval on-chain`);
+      setTxMsg(`✓ tBTC sent (${shortTx}) — Awaiting seller approval on-chain`);
       setTxState("success");
       onToast?.(`₿${nft.price.toFixed(4)} sent for ${nft.name} #${nft.num} — awaiting seller`, "success");
       setTimeout(() => setTxState("idle"), 6000);
@@ -974,11 +976,18 @@ function NFTModal({ nft, onClose, wallet, onOpenWallet, onToast }) {
         return;
       }
 
-      // Demo mode / wallet doesn't support sendBitcoin directly — show instructional flow
-      setTxState("success");
-      setTxMsg(`Send ₿${nft.price.toFixed(4)} to ${sellerAddr.slice(0,12)}… then seller will approve your address`);
-      onToast?.(`Purchase initiated for ${nft.name} #${nft.num} ✓`, "success");
-      setTimeout(() => setTxState("idle"), 8000);
+      if (msg.startsWith("__no_send_bitcoin__") || msg.startsWith("__demo__")) {
+        // Wallet doesn't support direct sendBitcoin — show manual instructions
+        setTxState("success");
+        setTxMsg(`Send ₿${nft.price.toFixed(4)} to ${sellerAddr.slice(0,16)}… then seller will approve`);
+        onToast?.(`Purchase initiated for ${nft.name} #${nft.num} ✓`, "success");
+        setTimeout(() => setTxState("idle"), 8000);
+        return;
+      }
+
+      setTxState("error");
+      setTxMsg(msg || "Transaction failed");
+      setTimeout(() => setTxState("idle"), 4000);
     }
   }, [wallet, nft, onOpenWallet, onToast]);
 
