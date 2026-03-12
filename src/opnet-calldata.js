@@ -26,14 +26,12 @@
 // ── Contract address ──────────────────────────────────────────────────────────
 // Set VITE_CONTRACT_ADDRESS in your .env or Vercel dashboard.
 // Falls back to the v6 testnet address for local dev.
-// CONTRACT_ADDRESS is injected by Vite at build time from VITE_CONTRACT_ADDRESS env var.
-// Using a function call defers evaluation so Rollup does not try to statically analyse
-// import.meta at module parse time (which breaks in some Rollup/esbuild pipelines).
-function _getContractAddress() {
-  try { return import.meta.env.VITE_CONTRACT_ADDRESS || "opt1sqzphaeuz4yn6fmhext577zypkg6uyemtwsvgjuvc"; }
-  catch { return "opt1sqzphaeuz4yn6fmhext577zypkg6uyemtwsvgjuvc"; }
-}
-export const CONTRACT_ADDRESS = _getContractAddress();
+// CONTRACT_ADDRESS — injected by Vite at build time from VITE_CONTRACT_ADDRESS.
+// Vite statically replaces import.meta.env.X during bundling, so this is safe.
+// Fallback is the v7 testnet contract address.
+export const CONTRACT_ADDRESS =
+  import.meta.env.VITE_CONTRACT_ADDRESS ||
+  "opt1sqpasc3xhpfdhex4xpfp26enenj2rq3lvfy4577w9";
 
 // ── Selector table ────────────────────────────────────────────────────────────
 // Pre-computed selectors for every PoYMarket public method.
@@ -307,45 +305,51 @@ export function encodeFinalizeEpoch(epochRewardUnits) {
  * @returns {Promise<{txHash: string}>}
  */
 export async function callContract(calldata, walletInfo, priorityFee = 5000n) {
-  const { walletId, address, instance } = walletInfo;
+  const { walletId } = walletInfo || {};
   const to = CONTRACT_ADDRESS;
 
-  // ── OP_WALLET (primary OP_NET wallet) ──────────────────────────────────────
+  // ── OP_WALLET ─────────────────────────────────────────────────────────────
+  // IMPORTANT: Always re-read window.opnet at call time.
+  // Stored instance references go stale after page navigation / extension reload.
   if (walletId === "op_wallet") {
-    const provider = instance || window.opnet || window.op_wallet || window.bitcoin;
+    // Try every known injection point
+    const provider =
+      window.opnet ||
+      window.op_wallet ||
+      window.bitcoin;   // OP_WALLET also injects window.bitcoin on some versions
+
     if (!provider) {
       throw new Error(
-        "OP_WALLET not detected. Please install the OP_WALLET Chrome extension: " +
+        "OP_WALLET not detected. Make sure the extension is installed and unlocked: " +
         "https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb"
       );
     }
 
-    // Primary API: sendTransaction (OP_WALLET v2+)
+    // OP_WALLET v2+ — primary API
     if (typeof provider.sendTransaction === "function") {
       const result = await provider.sendTransaction({ to, calldata, priorityFee });
-      return { txHash: result?.txid || result?.txHash || result?.hash || String(result) };
+      const txHash = result?.txid || result?.txHash || result?.hash || String(result);
+      return { txHash };
     }
 
-    // Fallback: signInteraction (older OP_WALLET)
+    // OP_WALLET v1 fallback — signInteraction
     if (typeof provider.signInteraction === "function") {
       const signed = await provider.signInteraction({ to, calldata, priorityFee: String(priorityFee) });
-      const broadcast = provider.broadcast || provider.broadcastTransaction;
-      if (typeof broadcast === "function") {
-        const result = await broadcast(signed);
+      const broadcastFn = provider.broadcast || provider.broadcastTransaction || provider.pushPsbt;
+      if (typeof broadcastFn === "function") {
+        const result = await broadcastFn(signed);
         return { txHash: result?.txid || result?.txHash || String(result) };
       }
-      // signInteraction may return txid directly on newer builds
       return { txHash: typeof signed === "string" ? signed : signed?.txid || "op_" + Date.now() };
     }
 
+    // Last resort — PSBT path (requires backend)
     throw new Error(
-      "OP_WALLET API not recognised — please update your OP_WALLET extension to the latest version."
+      "OP_WALLET version not supported. Please update to the latest OP_WALLET extension."
     );
   }
 
-  // ── UniSat — cannot call OP_NET contracts directly (no calldata support) ───
-  // UniSat uses signPsbt which requires a pre-built PSBT from the backend.
-  // For UniSat users, fall back to backend mode.
+  // Non-OP_WALLET wallets need backend PSBT — signal caller to use backend path
   throw new Error(`__needs_backend__:${walletId}`);
 }
 
@@ -359,16 +363,17 @@ export async function callContract(calldata, walletInfo, priorityFee = 5000n) {
  * @returns {Promise<{txHash: string}>}
  */
 export async function sendBTC(toAddress, satAmount, walletInfo) {
-  const { walletId, instance } = walletInfo;
+  const { walletId } = walletInfo || {};
 
   if (walletId === "op_wallet") {
-    const provider = instance || window.opnet || window.op_wallet;
-    if (!provider) throw new Error("OP_WALLET not found");
+    // Always re-read fresh — stored instance can go stale
+    const provider = window.opnet || window.op_wallet || window.bitcoin;
+    if (!provider) throw new Error("OP_WALLET not found — is the extension installed and unlocked?");
     if (typeof provider.sendBitcoin === "function") {
       const txid = await provider.sendBitcoin(toAddress, satAmount);
       return { txHash: typeof txid === "string" ? txid : txid?.txid || String(txid) };
     }
-    // Older OP_WALLET
+    // Older OP_WALLET: sendTransaction with value
     const result = await provider.sendTransaction({ to: toAddress, value: satAmount });
     return { txHash: result?.txid || result?.txHash || String(result) };
   }
