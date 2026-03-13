@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   CONTRACT_ADDRESS,
   callContract,
-  sendBTC,
   encodeMint,
   encodeTransfer,
   encodeList,
@@ -43,10 +42,10 @@ const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) || "http://l
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_NET transaction signing — correct patterns per official @btc-vision libs
 //
-// The RIGHT way to call OP_WALLET (from @btc-vision/walletconnect README):
-//   walletInstance.sendTransaction({ to, calldata, priorityFee })
-//   → walletInstance is the raw provider returned by useWalletConnect()
-//   → It handles UTXOs, PSBT construction, signing, and broadcasting internally
+// The RIGHT way to call OP_WALLET:
+//   provider.signInteraction({ to, calldata, priorityFee, callValue? })
+//   → provider is window.opnet / window.op_wallet (re-read fresh each call)
+//   → It handles UTXOs, PSBT construction, signing; then broadcast via provider.broadcast()
 //
 // For UniSat / OKX / Leather:
 //   Backend returns a pre-built PSBT hex → wallet signs it → wallet pushes it
@@ -64,7 +63,7 @@ function buildCalldata(endpoint, body) {
     case "list":         return encodeList(body.tokenId, body.priceSats);
     case "delist":       return encodeDelist(body.tokenId);
     case "approve-buyer":return encodeApproveBuyer(body.tokenId, body.buyer);
-    case "buy":          return encodeBuyNFT(body.tokenId, body.seller);
+    case "buy":          return encodeBuyNFT(body.tokenId);  // priceSats sent as callValue, not calldata
     case "offer":        return encodePlaceOffer(body.tokenId, body.offerSats);
     case "claim":        return encodeClaimYield(body.tokenId);
     default:
@@ -74,14 +73,14 @@ function buildCalldata(endpoint, body) {
 
 // ── sendContractTx — Hybrid: direct calldata path (OP_WALLET) + backend fallback
 //
-// For OP_WALLET:   Builds calldata client-side → sends via window.opnet.sendTransaction()
+// For OP_WALLET:   Builds calldata client-side → sends via signInteraction() + broadcast()
 //                  NO backend required. Works fully offline / without a server.
 //
 // For UniSat/OKX:  Falls back to backend for PSBT construction (they need pre-built PSBTs).
 //                  Backend VITE_API_BASE must be set. If backend is offline → demo mode.
 // ─────────────────────────────────────────────────────────────────────────────
 async function sendContractTx(endpoint, body, walletInfo) {
-  const { walletId, address, instance } = walletInfo ?? {};
+  const { walletId, address } = walletInfo ?? {};
 
   // ── OP_WALLET: encode calldata in-browser, send directly ─────────────────
   if (walletId === "op_wallet") {
@@ -89,11 +88,18 @@ async function sendContractTx(endpoint, body, walletInfo) {
     try {
       calldata = buildCalldata(endpoint, body);
     } catch (encErr) {
-      // encoding error (e.g. bad address) — surface to user
       throw new Error(`Calldata encoding failed: ${encErr.message}`);
     }
 
-    return callContract(calldata, walletInfo, 5000n);
+    // buyNFT and placeOffer are payable — the BTC amount must be sent WITH the tx as callValue.
+    // The contract reads payment from Blockchain.tx.value, not from calldata.
+    const callValue = endpoint === "buy"
+      ? BigInt(body.priceSats ?? 0)
+      : endpoint === "offer"
+      ? BigInt(body.offerSats ?? 0)
+      : 0n;
+
+    return callContract(calldata, walletInfo, 5000n, callValue);
   }
 
   // ── Other wallets (UniSat, OKX, Leather): need backend PSBT ──────────────
@@ -945,51 +951,50 @@ function NFTModal({ nft, onClose, wallet, onOpenWallet, onToast }) {
   const handleBuy = useCallback(async () => {
     if (!wallet) { onOpenWallet?.(); return; }
 
-    // PoY Market — verify-don't-custody purchase flow:
-    //   Step 1 — buyer sends BTC directly to seller's Bitcoin address (no contract involved)
-    //   Step 2 — seller sees payment on-chain → calls approveBuyer(tokenId, buyerAddress)
-    //   Step 3 — buyer calls buyNFT(tokenId, sellerAddress) → ownership transfers on OP_NET
-    //
-    // This function handles Step 1 (BTC send via OP_WALLET's sendBitcoin API).
+    // PoYMarket buy flow — single on-chain transaction:
+    //   buyer calls buyNFT(tokenId) and sends priceSats as tx.value in the same tx.
+    //   The contract verifies tx.value == listingPrice, then transfers ownership
+    //   and pays seller (minus fee) via Blockchain.tx.transfer internally.
+    //   No manual BTC send required — everything happens atomically.
+
+    const priceSats = Math.round(nft.price * 1e8);
 
     setTxState("pending");
-    setTxMsg("Sending tBTC to seller — confirm in OP_WALLET…");
-
-    const satAmount  = Math.round(nft.price * 1e8);
-    const sellerAddr = nft.owner;
+    setTxMsg(`Confirm in wallet — buying ${nft.name} for ₿${nft.price.toFixed(4)}…`);
 
     try {
-      // Use the imported sendBTC helper — handles OP_WALLET, UniSat, OKX
-      const { txHash: txid } = await sendBTC(sellerAddr, satAmount, wallet);
+      const result = await sendContractTx(
+        "buy",
+        { tokenId: nft.id, priceSats },  // priceSats used as callValue in OP_WALLET path
+        wallet
+      );
 
-      const shortTx = typeof txid === "string" ? txid.slice(0, 12) + "…" : "confirmed";
-      setTxMsg(`✓ tBTC sent (${shortTx}) — Awaiting seller approval on-chain`);
+      if (result?.demo) {
+        setTxMsg(`Demo: ${nft.name} #${nft.num} purchased ✓ (testnet demo mode)`);
+      } else {
+        const shortTx = typeof result?.txHash === "string" ? result.txHash.slice(0, 12) + "…" : "confirmed";
+        setTxMsg(`✓ Purchase confirmed (${shortTx}) — NFT transferred to your wallet`);
+      }
       setTxState("success");
-      onToast?.(`₿${nft.price.toFixed(4)} sent for ${nft.name} #${nft.num} — awaiting seller`, "success");
+      onToast?.(`${nft.name} #${nft.num} purchased ✓`, "success");
       setTimeout(() => setTxState("idle"), 6000);
 
     } catch (e) {
       const msg = e?.message ?? "";
-
       if (msg.includes("rejected") || msg.includes("cancel") || msg.includes("denied") || msg.includes("User refused")) {
         setTxState("error");
-        setTxMsg("Payment cancelled");
-        setTimeout(() => setTxState("idle"), 3000);
-        return;
+        setTxMsg("Purchase cancelled");
+      } else if (msg.includes("wrong payment")) {
+        setTxState("error");
+        setTxMsg("Price mismatch — the listing price may have changed. Refresh and try again.");
+      } else if (msg.includes("not listed")) {
+        setTxState("error");
+        setTxMsg("This NFT is no longer listed for sale.");
+      } else {
+        setTxState("error");
+        setTxMsg(msg || "Purchase failed — check your wallet and try again");
       }
-
-      if (msg.startsWith("__no_send_bitcoin__") || msg.startsWith("__demo__")) {
-        // Wallet doesn't support direct sendBitcoin — show manual instructions
-        setTxState("success");
-        setTxMsg(`Send ₿${nft.price.toFixed(4)} to ${sellerAddr.slice(0,16)}… then seller will approve`);
-        onToast?.(`Purchase initiated for ${nft.name} #${nft.num} ✓`, "success");
-        setTimeout(() => setTxState("idle"), 8000);
-        return;
-      }
-
-      setTxState("error");
-      setTxMsg(msg || "Transaction failed");
-      setTimeout(() => setTxState("idle"), 4000);
+      setTimeout(() => setTxState("idle"), 5000);
     }
   }, [wallet, nft, onOpenWallet, onToast]);
 
@@ -2791,7 +2796,7 @@ function FaucetTab({ wallet, onOpenWallet, onMint }) {
     {
       n: "04", icon: "🛒", title: "Buy an Existing Yield NFT",
       color: "#4D9FFF",
-      desc: "Browse the marketplace and buy a listed Yield NFT using your tBTC. Click 'Buy Now' on any listed NFT — your wallet will prompt you to send BTC to the seller.",
+      desc: "Browse the marketplace and buy a listed Yield NFT using your tBTC. Click 'Buy Now' on any listed NFT — confirm the transaction in your wallet to complete the purchase instantly.",
       links: [],
       tip: "PoYMarket uses a verify-don't-custody model — you send BTC directly to the seller's Bitcoin address. The seller then approves your wallet address on-chain and the NFT transfers automatically.",
       action: { label: "🛒 Go to Marketplace →", onClick: null /* set in render */ },

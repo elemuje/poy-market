@@ -34,22 +34,20 @@ export const CONTRACT_ADDRESS =
   "opt1sqpasc3xhpfdhex4xpfp26enenj2rq3lvfy4577w9";
 
 // ── Selector table ────────────────────────────────────────────────────────────
-// Pre-computed selectors for every PoYMarket public method.
-// Derived via OP_NET's encodeSelector = sha256(name)[0..3]
-// Values confirmed against the compiled contract ABI.
+// Selectors = sha256(methodName)[0:4] — OP_NET uses method name only, NOT full signature.
+// Contract source: callMethod uses encodeSelector('methodName') — confirmed in PoYMarket.ts.
 const SEL = {
-  mint:          0x1249c58b,  // mint(u256)
-  mintFor:       0xa0712d68,  // mintFor(address,u256)
-  nftTransfer:   0x42842e0e,  // nftTransfer(u256,address)
-  listNFT:       0x5bed5c8a,  // listNFT(u256,u256)
-  delistNFT:     0x3e9e9b5e,  // delistNFT(u256)
-  approveBuyer:  0x6a627842,  // approveBuyer(u256,address)
-  buyNFT:        0xa8174404,  // buyNFT(u256,address)
-  placeOffer:    0x2f865568,  // placeOffer(u256,u256)
-  claimYield:    0x372500ab,  // claimYield(u256)
-  finalizeEpoch: 0xf5357c90,  // finalizeEpoch(u256)
-  setPaused:     0xbedb86fb,  // setPaused(bool)
-  setFee:        0x69fe0e2d,  // setFee(u256)
+  mint:          0xdc6f17bb,  // sha256('mint')[0:4]
+  mintFor:       0xd20a45b1,  // sha256('mintFor')[0:4]
+  nftTransfer:   0x789e8d32,  // sha256('nftTransfer')[0:4]
+  listNFT:       0xbddede2e,  // sha256('listNFT')[0:4]
+  delistNFT:     0xc326f375,  // sha256('delistNFT')[0:4]
+  buyNFT:        0x75797eb3,  // sha256('buyNFT')[0:4]
+  placeOffer:    0xe3a30a9c,  // sha256('placeOffer')[0:4]
+  claimYield:    0x652e4672,  // sha256('claimYield')[0:4]
+  finalizeEpoch: 0x6372c535,  // sha256('finalizeEpoch')[0:4]
+  setPaused:     0xe2f49a0c,  // sha256('setPaused')[0:4]
+  setFee:        0x76d218c1,  // sha256('setFee')[0:4]
 };
 
 // ── BinaryWriter ──────────────────────────────────────────────────────────────
@@ -246,26 +244,36 @@ export function encodeApproveBuyer(tokenId, buyerAddress) {
 }
 
 /**
- * buyNFT(tokenId: u256, seller: address)
- * Buyer calls this after seller has approved them.
+ * buyNFT(tokenId: u256)
+ * Contract reads tokenId from calldata. Payment amount comes via Blockchain.tx.value.
+ * The caller must send BTC equal to the listing price in the same tx (callValue).
+ *
+ * @param {bigint|number|string} tokenId
+ * @param {bigint|number|string} priceSats - amount in satoshis to send with the tx (callValue)
  */
-export function encodeBuyNFT(tokenId, sellerAddress) {
+export function encodeBuyNFT(tokenId) {
+  // priceSats is NOT in calldata — it's sent as tx.value (callValue in signInteraction).
+  // The contract verifies Blockchain.tx.value == listingPrice.
   return new BinaryWriter()
     .writeSelector(SEL.buyNFT)
     .writeU256(BigInt(tokenId))
-    .writeAddress(sellerAddress)
     .toHex();
 }
 
 /**
- * placeOffer(tokenId: u256, offerSats: u256)
+ * placeOffer(tokenId: u256)
+ * Contract reads tokenId from calldata. Offer amount comes via Blockchain.tx.value.
+ * The caller must send BTC equal to their offer amount in the same tx (callValue).
+ *
+ * @param {bigint|number|string} tokenId
+ * @param {bigint|number|string} offerSats - amount in satoshis to send with the tx (callValue)
  */
 export function encodePlaceOffer(tokenId, offerSats) {
   return new BinaryWriter()
     .writeSelector(SEL.placeOffer)
     .writeU256(BigInt(tokenId))
-    .writeU256(BigInt(offerSats))
     .toHex();
+  // offerSats param is kept for API compatibility; the value is sent via callValue in signInteraction
 }
 
 /**
@@ -332,7 +340,13 @@ function getOpWalletProvider() {
  * @param {bigint}  [priorityFee] - satoshis priority fee (default 5000n)
  * @returns {Promise<{txHash: string}>}
  */
-export async function callContract(calldata, walletInfo, priorityFee = 5000n) {
+/**
+ * @param {string}  calldata      - hex calldata (0x-prefixed)
+ * @param {object}  walletInfo    - { walletId, address }
+ * @param {bigint}  [priorityFee] - satoshis priority fee (default 5000n)
+ * @param {bigint}  [callValue]   - satoshis to send WITH the tx (for payable methods: buyNFT, placeOffer)
+ */
+export async function callContract(calldata, walletInfo, priorityFee = 5000n, callValue = 0n) {
   const { walletId } = walletInfo || {};
   const to = CONTRACT_ADDRESS;
 
@@ -353,12 +367,18 @@ export async function callContract(calldata, walletInfo, priorityFee = 5000n) {
 
   // ── Primary path: signInteraction (the real OP_WALLET contract call API) ────────
   if (typeof provider.signInteraction === "function") {
-    // signInteraction signs the OP_NET interaction and returns the signed tx/PSBT
-    const signed = await provider.signInteraction({
+    // Build the interaction params. callValue is used for payable methods (buyNFT, placeOffer).
+    const interactionParams = {
       to,
       calldata,
       priorityFee: Number(priorityFee),  // OP_WALLET expects a number, not BigInt
-    });
+    };
+    if (callValue > 0n) {
+      // Some OP_WALLET builds use 'value', others 'callValue' — include both for compatibility
+      interactionParams.value = Number(callValue);
+      interactionParams.callValue = Number(callValue);
+    }
+    const signed = await provider.signInteraction(interactionParams);
 
     // Case 1: signInteraction already broadcast and returned a txid string
     if (typeof signed === "string" && signed.length >= 40 && !signed.startsWith("02")) {
