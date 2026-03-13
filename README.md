@@ -114,3 +114,22 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:3001'
 ## License
 
 MIT
+
+---
+
+## Contract Calldata Encoder
+
+`src/opnet-calldata.js` — pure-JS OP_NET calldata encoder. No backend needed for OP_WALLET users.
+
+- Selectors: `sha256(methodName)[0:4]` (OP_NET standard)
+- Encodes all 8 write methods + `callValue` for payable methods
+- `buyNFT` and `placeOffer` send BTC as `tx.value` via `callValue` in `signInteraction`
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `VITE_CONTRACT_ADDRESS` | PoYMarket contract address (falls back to v7 testnet) |
+| `VITE_API_BASE` | Backend URL for UniSat/OKX/Leather PSBT path (optional for OP_WALLET) |
+
+Set these in `.env.local` or Vercel dashboard.

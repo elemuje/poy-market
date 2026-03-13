@@ -9,9 +9,9 @@
  * OP_NET calldata wire format:
  *   [4 bytes: method selector]  [args...]
  *
- * Method selector = first 4 bytes of keccak256(methodSignature)
- *   BUT OP_NET uses its own encodeSelector which is:
- *   sha256(methodName) → take first 4 bytes  (NOT keccak256)
+ * Method selector = sha256(methodName)[0:4]
+ *   OP_NET uses method name only (NOT full signature, NOT keccak256).
+ *   e.g. sha256('mint')[0:4] = 0xdc6f17bb
  *
  * All values are little-endian unless noted.
  * u256 values are encoded as 32 bytes little-endian.
@@ -232,18 +232,6 @@ export function encodeDelist(tokenId) {
 }
 
 /**
- * approveBuyer(tokenId: u256, buyer: address)
- * Seller calls this after confirming BTC payment received.
- */
-export function encodeApproveBuyer(tokenId, buyerAddress) {
-  return new BinaryWriter()
-    .writeSelector(SEL.approveBuyer)
-    .writeU256(BigInt(tokenId))
-    .writeAddress(buyerAddress)
-    .toHex();
-}
-
-/**
  * buyNFT(tokenId: u256)
  * Contract reads tokenId from calldata. Payment amount comes via Blockchain.tx.value.
  * The caller must send BTC equal to the listing price in the same tx (callValue).
@@ -268,12 +256,13 @@ export function encodeBuyNFT(tokenId) {
  * @param {bigint|number|string} tokenId
  * @param {bigint|number|string} offerSats - amount in satoshis to send with the tx (callValue)
  */
-export function encodePlaceOffer(tokenId, offerSats) {
+export function encodePlaceOffer(tokenId) {
+  // Amount is NOT in calldata — it's sent as callValue (tx.value) in signInteraction.
+  // The contract reads Blockchain.tx.value for the offer amount.
   return new BinaryWriter()
     .writeSelector(SEL.placeOffer)
     .writeU256(BigInt(tokenId))
     .toHex();
-  // offerSats param is kept for API compatibility; the value is sent via callValue in signInteraction
 }
 
 /**
@@ -330,7 +319,7 @@ function getOpWalletProvider() {
  * and signing internally — the dApp never touches a private key.
  *
  * Flow:
- *   1. provider.signInteraction({ to, calldata, priorityFee })
+ *   1. provider.signInteraction({ to, calldata, priorityFee, [value/callValue] })
  *      → returns signed PSBT / tx blob
  *   2. provider.broadcast(signedTx)
  *      → returns txid string
@@ -338,13 +327,7 @@ function getOpWalletProvider() {
  * @param {string}  calldata      - hex calldata (0x-prefixed)
  * @param {object}  walletInfo    - { walletId, address }
  * @param {bigint}  [priorityFee] - satoshis priority fee (default 5000n)
- * @returns {Promise<{txHash: string}>}
- */
-/**
- * @param {string}  calldata      - hex calldata (0x-prefixed)
- * @param {object}  walletInfo    - { walletId, address }
- * @param {bigint}  [priorityFee] - satoshis priority fee (default 5000n)
- * @param {bigint}  [callValue]   - satoshis to send WITH the tx (for payable methods: buyNFT, placeOffer)
+ * @param {bigint}  [callValue]   - satoshis to attach as tx.value (buyNFT, placeOffer)
  */
 export async function callContract(calldata, walletInfo, priorityFee = 5000n, callValue = 0n) {
   const { walletId } = walletInfo || {};
