@@ -2299,8 +2299,6 @@ function MarketTab({ onOpen, recentlyViewed, onMint }) {
   return (
     <div>
       <Hero onMint={onMint} onExplore={() => exploreRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })} />
-      {/* Testnet Faucet Banner — shown below Hero, not above it */}
-      <FaucetBanner />
 
       {/* Stats grid */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 1, background: C.border, borderRadius: 14, overflow: "hidden", marginBottom: 20 }}>

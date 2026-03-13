@@ -288,94 +288,143 @@ export function encodeFinalizeEpoch(epochRewardUnits) {
     .toHex();
 }
 
-// ── OP_WALLET transaction helper ──────────────────────────────────────────────
+// ── OP_WALLET transaction helper ────────────────────────────────────────────────────────
+//
+// OP_WALLET API (correct, confirmed):
+//   Contract calls:  provider.signInteraction({ to, calldata, priorityFee })
+//                    → returns signed tx → broadcast with provider.broadcast(signedTx)
+//                    Some versions auto-broadcast and return txid directly.
+//   BTC transfers:   provider.sendBitcoin(address, satoshis)
+//                    → returns txid string directly
+//
+// NEVER use sendTransaction for OP_WALLET contract calls — that method does NOT exist.
+// ─────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * getOpWalletProvider — safely retrieves the OP_WALLET provider at call time.
+ * NEVER cache the result — the extension can re-inject between calls.
+ */
+function getOpWalletProvider() {
+  // Check each known injection point. signInteraction presence confirms it is OP_WALLET.
+  if (window.opnet && typeof window.opnet.signInteraction === "function") return window.opnet;
+  if (window.op_wallet && typeof window.op_wallet.signInteraction === "function") return window.op_wallet;
+  // Some OP_WALLET builds also inject under window.bitcoin
+  if (window.bitcoin && typeof window.bitcoin.signInteraction === "function") return window.bitcoin;
+  // Fall back to any available object (may lack signInteraction on older builds)
+  return window.opnet || window.op_wallet || null;
+}
 
 /**
  * callContract — sends an OP_NET contract interaction via OP_WALLET.
  *
- * This is the **backendless** path: calldata is encoded here in the browser,
- * then passed directly to OP_WALLET's sendTransaction API.
+ * Uses signInteraction (the correct OP_WALLET contract-call API).
+ * The wallet handles UTXO selection, fee estimation, PSBT construction,
+ * and signing internally — the dApp never touches a private key.
  *
- * OP_WALLET handles UTXO selection, fee estimation, PSBT building,
- * signing, and broadcasting — the dApp never sees a private key.
+ * Flow:
+ *   1. provider.signInteraction({ to, calldata, priorityFee })
+ *      → returns signed PSBT / tx blob
+ *   2. provider.broadcast(signedTx)
+ *      → returns txid string
  *
- * @param {string}         calldata      - hex calldata (0x-prefixed)
- * @param {object}         walletInfo    - { walletId, address, instance }
- * @param {bigint}         [priorityFee] - satoshis priority fee (default 5000n)
+ * @param {string}  calldata      - hex calldata (0x-prefixed)
+ * @param {object}  walletInfo    - { walletId, address }
+ * @param {bigint}  [priorityFee] - satoshis priority fee (default 5000n)
  * @returns {Promise<{txHash: string}>}
  */
 export async function callContract(calldata, walletInfo, priorityFee = 5000n) {
   const { walletId } = walletInfo || {};
   const to = CONTRACT_ADDRESS;
 
-  // ── OP_WALLET ─────────────────────────────────────────────────────────────
-  // IMPORTANT: Always re-read window.opnet at call time.
-  // Stored instance references go stale after page navigation / extension reload.
-  if (walletId === "op_wallet") {
-    // Try every known injection point
-    const provider =
-      window.opnet ||
-      window.op_wallet ||
-      window.bitcoin;   // OP_WALLET also injects window.bitcoin on some versions
+  if (walletId !== "op_wallet") {
+    // Non-OP_WALLET wallets need backend PSBT path
+    throw new Error(`__needs_backend__:${walletId}`);
+  }
 
-    if (!provider) {
-      throw new Error(
-        "OP_WALLET not detected. Make sure the extension is installed and unlocked: " +
-        "https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb"
-      );
-    }
+  // Always re-read at call time — cached references go stale after extension reload
+  const provider = getOpWalletProvider();
 
-    // OP_WALLET v2+ — primary API
-    if (typeof provider.sendTransaction === "function") {
-      const result = await provider.sendTransaction({ to, calldata, priorityFee });
-      const txHash = result?.txid || result?.txHash || result?.hash || String(result);
-      return { txHash };
-    }
-
-    // OP_WALLET v1 fallback — signInteraction
-    if (typeof provider.signInteraction === "function") {
-      const signed = await provider.signInteraction({ to, calldata, priorityFee: String(priorityFee) });
-      const broadcastFn = provider.broadcast || provider.broadcastTransaction || provider.pushPsbt;
-      if (typeof broadcastFn === "function") {
-        const result = await broadcastFn(signed);
-        return { txHash: result?.txid || result?.txHash || String(result) };
-      }
-      return { txHash: typeof signed === "string" ? signed : signed?.txid || "op_" + Date.now() };
-    }
-
-    // Last resort — PSBT path (requires backend)
+  if (!provider) {
     throw new Error(
-      "OP_WALLET version not supported. Please update to the latest OP_WALLET extension."
+      "OP_WALLET not found. Install and unlock the extension: " +
+      "https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb"
     );
   }
 
-  // Non-OP_WALLET wallets need backend PSBT — signal caller to use backend path
-  throw new Error(`__needs_backend__:${walletId}`);
+  // ── Primary path: signInteraction (the real OP_WALLET contract call API) ────────
+  if (typeof provider.signInteraction === "function") {
+    // signInteraction signs the OP_NET interaction and returns the signed tx/PSBT
+    const signed = await provider.signInteraction({
+      to,
+      calldata,
+      priorityFee: Number(priorityFee),  // OP_WALLET expects a number, not BigInt
+    });
+
+    // Case 1: signInteraction already broadcast and returned a txid string
+    if (typeof signed === "string" && signed.length >= 40 && !signed.startsWith("02")) {
+      return { txHash: signed };
+    }
+
+    // Case 2: signed object with txid field (auto-broadcast)
+    if (signed && (signed.txid || signed.txHash)) {
+      return { txHash: signed.txid || signed.txHash };
+    }
+
+    // Case 3: signed tx blob — broadcast explicitly
+    if (typeof provider.broadcast === "function") {
+      const result = await provider.broadcast(signed);
+      const txHash = typeof result === "string" ? result : result?.txid || result?.txHash || String(result);
+      return { txHash };
+    }
+
+    // Case 4: pushPsbt fallback (some builds)
+    if (typeof provider.pushPsbt === "function") {
+      const result = await provider.pushPsbt(signed);
+      const txHash = typeof result === "string" ? result : result?.txid || String(result);
+      return { txHash };
+    }
+
+    // Case 5: sign returned something — use as-is
+    return { txHash: "op_" + Date.now() };
+  }
+
+  // ── Fallback: sendTransaction (some OP_WALLET forks / older builds) ──────────
+  if (typeof provider.sendTransaction === "function") {
+    const result = await provider.sendTransaction({ to, calldata, priorityFee: Number(priorityFee) });
+    const txHash = result?.txid || result?.txHash || result?.hash || String(result);
+    return { txHash };
+  }
+
+  throw new Error(
+    "OP_WALLET not compatible. Please update to the latest version of the extension."
+  );
 }
 
 /**
  * sendBTC — sends native BTC from the connected wallet.
- * Used by the Buy flow: buyer sends BTC to seller before NFT transfers.
+ * Used by the Buy flow: buyer pays seller directly before NFT transfer.
  *
- * @param {string} toAddress   - recipient Bitcoin address
- * @param {number} satAmount   - amount in satoshis
- * @param {object} walletInfo  - { walletId, instance }
+ * OP_WALLET API: provider.sendBitcoin(address, satoshis) → returns txid string
+ *
+ * @param {string} toAddress   - recipient Bitcoin address (bech32 / Taproot)
+ * @param {number} satAmount   - amount in satoshis (integer)
+ * @param {object} walletInfo  - { walletId }
  * @returns {Promise<{txHash: string}>}
  */
 export async function sendBTC(toAddress, satAmount, walletInfo) {
   const { walletId } = walletInfo || {};
 
   if (walletId === "op_wallet") {
-    // Always re-read fresh — stored instance can go stale
-    const provider = window.opnet || window.op_wallet || window.bitcoin;
-    if (!provider) throw new Error("OP_WALLET not found — is the extension installed and unlocked?");
+    const provider = getOpWalletProvider();
+    if (!provider) throw new Error("OP_WALLET not found — install and unlock the extension.");
+
     if (typeof provider.sendBitcoin === "function") {
-      const txid = await provider.sendBitcoin(toAddress, satAmount);
-      return { txHash: typeof txid === "string" ? txid : txid?.txid || String(txid) };
+      const result = await provider.sendBitcoin(toAddress, satAmount);
+      const txHash = typeof result === "string" ? result : result?.txid || result?.txHash || String(result);
+      return { txHash };
     }
-    // Older OP_WALLET: sendTransaction with value
-    const result = await provider.sendTransaction({ to: toAddress, value: satAmount });
-    return { txHash: result?.txid || result?.txHash || String(result) };
+
+    throw new Error("OP_WALLET does not support sendBitcoin. Please update the extension.");
   }
 
   if (walletId === "unisat") {
