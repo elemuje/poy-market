@@ -78,7 +78,8 @@ function genContractId() {
 function makeInitialNFTs() {
   return Array.from({ length: 14 }, (_, i) => {
     const tier = STAKING_CONFIG.tiers[i % 4];
-    const stakedCC = tier.minCC + Math.floor(Math.random() * (Math.min(tier.maxCC, tier.minCC * 3) - tier.minCC));
+    const maxForGen = tier.maxCC === Infinity ? tier.minCC * 5 : tier.maxCC;
+    const stakedCC = tier.minCC + Math.floor(Math.random() * (maxForGen - tier.minCC));
     const accrued = +(stakedCC * tier.cbTcAPY / 100 * ((Math.random() * 30 + 5) / 365)).toFixed(6);
     return {
       id: genNFTId(),
@@ -150,6 +151,10 @@ export function connectWallet(provider) {
 }
 
 export function disconnectWallet() {
+  // Remove any NFTs the user had listed in the marketplace
+  if (ledger.partyId) {
+    ledger.marketNFTs = ledger.marketNFTs.filter(n => n.owner !== ledger.partyId);
+  }
   ledger.party = null;
   ledger.partyId = null;
   ledger.email = null;
@@ -161,7 +166,9 @@ export function disconnectWallet() {
 
 // ── Staking operations ──────────────────────────────────────────────────────
 export function stakeCC(ccAmount) {
+  if (!Number.isFinite(ccAmount) || ccAmount <= 0) throw new Error('Invalid stake amount');
   if (ccAmount < STAKING_CONFIG.minStake) throw new Error(`Minimum stake is ${STAKING_CONFIG.minStake} CC`);
+  if (ccAmount > STAKING_CONFIG.maxStake) throw new Error(`Maximum stake is ${STAKING_CONFIG.maxStake.toLocaleString()} CC`);
   if (ccAmount > ledger.ccBalance) throw new Error('Insufficient CC balance');
   const tier = getTier(ccAmount);
   const stake = {
@@ -229,11 +236,18 @@ export function accrueYield() {
 export function claimYield(nftId) {
   const nft = ledger.myNFTs.find(n => n.id === nftId);
   if (!nft) throw new Error('NFT not found');
-  if (nft.accruedCBTC <= 0) throw new Error('No yield to claim');
+  // Use a minimum threshold to avoid floating-point dust claims
+  if (nft.accruedCBTC < 0.00000001) throw new Error('No yield to claim');
   const claimed = nft.accruedCBTC;
   ledger.cbtcBalance = +(ledger.cbtcBalance + claimed).toFixed(8);
   ledger.totalCBTCDistributed += claimed;
+  // Reset BOTH nft and its parent stake so accrueYield() doesn't re-populate from stale stake value
   nft.accruedCBTC = 0;
+  const stake = ledger.stakes.find(s => s.nftId === nftId);
+  if (stake) {
+    stake.accruedCBTC = 0;
+    stake.startTime = Date.now(); // reset accrual window from claim point
+  }
   addActivity('Claimed', `Claimed ${claimed.toFixed(8)} CBTC from ${nft.name}`);
   return claimed;
 }
@@ -243,10 +257,12 @@ export function listNFT(nftId, price, token = 'CC') {
   const nft = ledger.myNFTs.find(n => n.id === nftId);
   if (!nft) throw new Error('NFT not found');
   if (price <= 0) throw new Error('Price must be greater than 0');
+  if (nft.listed) throw new Error('NFT is already listed');
   nft.listed = true;
   nft.listingPrice = price;
   nft.listingToken = token;
-  ledger.marketNFTs.push({ ...nft });
+  // Push the actual object reference (not a copy) so delistNFT mutations stay in sync
+  ledger.marketNFTs.push(nft);
   addActivity('Listed', `Listed ${nft.name} for ${price} ${token}`);
   return nft;
 }
@@ -282,7 +298,13 @@ export function buyNFT(nftId) {
 export function placeBid(nftId, bidAmount, token = 'CC') {
   const mkt = ledger.marketNFTs.find(n => n.id === nftId);
   if (!mkt) throw new Error('NFT not found');
+  if (bidAmount <= 0) throw new Error('Bid amount must be greater than 0');
+  if (!Number.isFinite(bidAmount)) throw new Error('Invalid bid amount');
+  if (mkt.owner === ledger.partyId) throw new Error('You cannot bid on your own NFT');
   if (bidAmount <= mkt.highBid) throw new Error('Bid must be higher than current highest bid');
+  // Validate bidder balance
+  if (token === 'CC' && ledger.ccBalance < bidAmount) throw new Error('Insufficient CC balance to place this bid');
+  if (token === 'CBTC' && ledger.cbtcBalance < bidAmount) throw new Error('Insufficient CBTC balance to place this bid');
   mkt.highBid = bidAmount;
   addActivity('Bid', `Placed bid of ${bidAmount} ${token} on ${mkt.name}`);
 }

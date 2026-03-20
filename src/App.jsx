@@ -59,6 +59,8 @@ function initLoop(onAccept, onReject) {
     },
     onReject: () => {
       loopProvider = null;
+      // Reset so the user can try connecting again after a rejection
+      loopInitialized = false;
       onReject();
     },
     onTransactionUpdate: (payload) => {
@@ -514,6 +516,48 @@ function NFTDetailModal({ nft, onClose, wallet, onAction }) {
   );
 }
 
+// ── Stake Row ─────────────────────────────────────────────────────────────
+// Extracted as its own component so useState is called at the top level,
+// not inside a .map() — which violates React's Rules of Hooks.
+function StakeRow({ stake, onRefresh }) {
+  const [mintState, setMintState] = useState('idle');
+  const [mintMsg, setMintMsg] = useState('');
+
+  const handleMint = async () => {
+    setMintState('pending'); setMintMsg('Minting…');
+    await new Promise(r => setTimeout(r, 1200));
+    try {
+      mintYieldNFT(stake.id);
+      setMintState('success'); setMintMsg('NFT minted!');
+      onRefresh();
+      setTimeout(() => { setMintState('idle'); setMintMsg(''); }, 3000);
+    } catch (e) {
+      setMintState('error'); setMintMsg(e.message);
+      setTimeout(() => setMintState('idle'), 3000);
+    }
+  };
+
+  return (
+    <Card key={stake.id} style={{ padding: 18 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+          <div><div style={{ fontSize: 9, color: C.muted }}>STAKE ID</div><Mono>{stake.id}</Mono></div>
+          <div><div style={{ fontSize: 9, color: C.muted }}>AMOUNT</div><Mono color={C.secondary}>{fmt(stake.ccAmount)} CC</Mono></div>
+          <div><div style={{ fontSize: 9, color: C.muted }}>TIER</div><Mono color={C.text}>{stake.tier}</Mono></div>
+          <div><div style={{ fontSize: 9, color: C.muted }}>APY</div><Mono color={C.cbtc}>{stake.apy}%</Mono></div>
+          <div><div style={{ fontSize: 9, color: C.muted }}>ACCRUED CBTC</div><Mono color={C.cbtc}>₿ {fmtBtc(stake.accruedCBTC)}</Mono></div>
+        </div>
+        {!stake.nftId ? (
+          <Btn size="sm" variant="primary" disabled={mintState === 'pending'} onClick={handleMint}>
+            {mintState === 'pending' ? 'Minting…' : '⬡ Mint Yield NFT'}
+          </Btn>
+        ) : <Tag color={C.success}>NFT MINTED ✓</Tag>}
+      </div>
+      <StatusBar state={mintState} msg={mintMsg} />
+    </Card>
+  );
+}
+
 // ── NFT Card ──────────────────────────────────────────────────────────────
 function NFTCard({ nft, onClick, size = 'md' }) {
   const [hov, setHov] = useState(false);
@@ -570,7 +614,7 @@ function StatsBar() {
     { label: 'CBTC DISTRIBUTED', value: fmtBtc(ledger.totalCBTCDistributed + tick * 0.000003) },
     { label: 'NFTs MINTED', value: String(ledger.totalNFTsMinted + Math.floor(tick / 4)) },
     { label: 'CURRENT EPOCH', value: `#${ledger.currentEpoch}` },
-    { label: 'NEXT EPOCH', value: `${ledger.nextEpochHours - Math.floor(tick/12)}h` },
+    { label: 'NEXT EPOCH', value: `${Math.max(0, ledger.nextEpochHours - Math.floor(tick/12))}h` },
   ];
   return (
     <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '10px 0', overflowX: 'auto' }}>
@@ -795,42 +839,9 @@ export default function App() {
               <div>
                 <h2 style={{ fontFamily: FONT.display, fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 14 }}>Your Stakes</h2>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  {ledger.stakes.map(stake => {
-                    const [mintState, setMintState] = useState('idle');
-                    const [mintMsg, setMintMsg] = useState('');
-                    return (
-                      <Card key={stake.id} style={{ padding: 18 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-                          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-                            <div><div style={{ fontSize: 9, color: C.muted }}>STAKE ID</div><Mono>{stake.id}</Mono></div>
-                            <div><div style={{ fontSize: 9, color: C.muted }}>AMOUNT</div><Mono color={C.secondary}>{fmt(stake.ccAmount)} CC</Mono></div>
-                            <div><div style={{ fontSize: 9, color: C.muted }}>TIER</div><Mono color={C.text}>{stake.tier}</Mono></div>
-                            <div><div style={{ fontSize: 9, color: C.muted }}>APY</div><Mono color={C.cbtc}>{stake.apy}%</Mono></div>
-                            <div><div style={{ fontSize: 9, color: C.muted }}>ACCRUED CBTC</div><Mono color={C.cbtc}>₿ {fmtBtc(stake.accruedCBTC)}</Mono></div>
-                          </div>
-                          {!stake.nftId ? (
-                            <Btn size="sm" variant="primary" disabled={mintState === 'pending'}
-                              onClick={async () => {
-                                setMintState('pending'); setMintMsg('Minting…');
-                                await new Promise(r => setTimeout(r, 1200));
-                                try {
-                                  mintYieldNFT(stake.id);
-                                  setMintState('success'); setMintMsg('NFT minted!');
-                                  setRefresh(x => x+1);
-                                  setTimeout(() => { setMintState('idle'); setMintMsg(''); }, 3000);
-                                } catch (e) {
-                                  setMintState('error'); setMintMsg(e.message);
-                                  setTimeout(() => setMintState('idle'), 3000);
-                                }
-                              }}>
-                              {mintState === 'pending' ? 'Minting…' : '⬡ Mint Yield NFT'}
-                            </Btn>
-                          ) : <Tag color={C.success}>NFT MINTED ✓</Tag>}
-                        </div>
-                        <StatusBar state={mintState} msg={mintMsg} />
-                      </Card>
-                    );
-                  })}
+                  {ledger.stakes.map(stake => (
+                    <StakeRow key={stake.id} stake={stake} onRefresh={() => setRefresh(x => x+1)} />
+                  ))}
                 </div>
               </div>
             )}
