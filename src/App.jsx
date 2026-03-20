@@ -1,3213 +1,933 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+/**
+ * Canton PoY Market — App.jsx
+ * Complete Yield NFT Staking & Marketplace on Canton Network
+ * Wallet: Canton Loop (via @fivenorth/loop-sdk)
+ * Tokens: CC (stake) → CBTC (yield rewards)
+ */
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { loop } from '@fivenorth/loop-sdk';
 import {
-  callContract,
-  encodeMint,
-  encodeTransfer,
-  encodeList,
-  encodeDelist,
-  encodeBuyNFT,
-  encodePlaceOffer,
-  encodeClaimYield,
-} from "./opnet-calldata.js";
+  ledger, TOKENS, STAKING_CONFIG, getTier,
+  connectWallet, disconnectWallet,
+  stakeCC, mintYieldNFT, claimYield, accrueYield,
+  listNFT, delistNFT, buyNFT, placeBid,
+} from './canton-store.js';
 
-/* ── Responsive breakpoint hook ───────────────────────────────────────── */
-function useBreakpoint() {
-  const [w, setW] = useState(() => typeof window !== "undefined" ? window.innerWidth : 1200);
-  useEffect(() => {
-    const handler = () => setW(window.innerWidth);
-    window.addEventListener("resize", handler);
-    return () => window.removeEventListener("resize", handler);
-  }, []);
-  return { isMobile: w < 640, isTablet: w < 1024, w };
-}
+// ── Fonts ─────────────────────────────────────────────────────────────────
+const FONTS = `@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500;700&display=swap');`;
 
-/* ── Global mobile CSS ─────────────────────────────────────────────────── */
-const MOBILE_CSS = `
-  * { -webkit-tap-highlight-color: transparent; }
-  html { scroll-behavior: smooth; }
-  input, button, select, textarea { touch-action: manipulation; }
-  ::-webkit-scrollbar { width: 4px; height: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #2a2840; border-radius: 4px; }
-`;
-
-/* ── Backend API base ────────────────────────────────────────────────────── */
-const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) || "http://localhost:3001";
-
-/* ── Contract TX helper ──────────────────────────────────────────────────── */
-// 1. Encodes calldata via the PoYMarket backend (contract address stays server-side)
-// 2. Asks the connected wallet to sign + broadcast the OP_NET interaction
-// ─────────────────────────────────────────────────────────────────────────────
-// OP_NET transaction signing — correct patterns per official @btc-vision libs
-//
-// The RIGHT way to call OP_WALLET:
-//   provider.signInteraction({ to, calldata, priorityFee, callValue? })
-//   → provider is window.opnet / window.op_wallet (re-read fresh each call)
-//   → It handles UTXOs, PSBT construction, signing; then broadcast via provider.broadcast()
-//
-// For UniSat / OKX / Leather:
-//   Backend returns a pre-built PSBT hex → wallet signs it → wallet pushes it
-//
-// Backend returns: { psbt?: "<hex>", to: "<contractAddr>", calldata: "<hex>" }
-// Demo mode (backend offline): returns a fake txHash after 1.2s.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Calldata builders: map each UI action to the right encoder ────────────────
-// Returns hex calldata using the pure-JS opnet-calldata.js encoder (no backend).
-function buildCalldata(endpoint, body) {
-  switch (endpoint) {
-    case "mint":         return encodeMint(body.stakedAmount);
-    case "transfer":     return encodeTransfer(body.tokenId, body.to);
-    case "list":         return encodeList(body.tokenId, body.priceSats);
-    case "delist":       return encodeDelist(body.tokenId);
-    case "buy":          return encodeBuyNFT(body.tokenId);  // priceSats sent as callValue, not calldata
-    case "offer":        return encodePlaceOffer(body.tokenId);  // offerSats sent as callValue
-    case "claim":        return encodeClaimYield(body.tokenId);
-    default:
-      throw new Error(`Unknown PoYMarket endpoint: ${endpoint}`);
-  }
-}
-
-// ── sendContractTx — Hybrid: direct calldata path (OP_WALLET) + backend fallback
-//
-// For OP_WALLET:   Builds calldata client-side → sends via signInteraction() + broadcast()
-//                  NO backend required. Works fully offline / without a server.
-//
-// For UniSat/OKX:  Falls back to backend for PSBT construction (they need pre-built PSBTs).
-//                  Backend VITE_API_BASE must be set. If backend is offline → demo mode.
-// ─────────────────────────────────────────────────────────────────────────────
-async function sendContractTx(endpoint, body, walletInfo) {
-  const { walletId, address } = walletInfo ?? {};
-
-  // ── OP_WALLET: encode calldata in-browser, send directly ─────────────────
-  if (walletId === "op_wallet") {
-    let calldata;
-    try {
-      calldata = buildCalldata(endpoint, body);
-    } catch (encErr) {
-      throw new Error(`Calldata encoding failed: ${encErr.message}`);
-    }
-
-    // buyNFT and placeOffer are payable — the BTC amount must be sent WITH the tx as callValue.
-    // The contract reads payment from Blockchain.tx.value, not from calldata.
-    const callValue = endpoint === "buy"
-      ? BigInt(body.priceSats ?? 0)
-      : endpoint === "offer"
-      ? BigInt(body.offerSats ?? 0)
-      : 0n;
-
-    return callContract(calldata, walletInfo, 5000n, callValue);
-  }
-
-  // ── Other wallets (UniSat, OKX, Leather): need backend PSBT ──────────────
-  // Try backend first, fall back to demo mode if offline.
-  let txData;
-  try {
-    const res = await fetch(`${API_BASE}/api/encode/${endpoint}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `Server error ${res.status}`);
-    }
-    txData = await res.json();
-  } catch (e) {
-    console.warn("[PoYMarket] Backend offline — demo mode:", e.message);
-    return new Promise((r) =>
-      setTimeout(() => r({ txHash: "demo_" + Math.random().toString(16).slice(2, 10), demo: true }), 1200)
-    );
-  }
-
-  const psbtHex = txData.psbt || "";
-
-  if (walletId === "unisat") {
-    const w = window.unisat;
-    if (!w) throw new Error("UniSat extension not found.");
-    if (!psbtHex) throw new Error("No PSBT from backend for UniSat signing.");
-    const signed = await w.signPsbt(psbtHex, { autoFinalized: true, toSignInputs: [{ index: 0, address }] });
-    const txid   = await w.pushPsbt(signed);
-    return { txHash: txid };
-  }
-
-  if (walletId === "okx") {
-    const w = window.okxwallet?.bitcoin || window.okxwallet;
-    if (!w) throw new Error("OKX Wallet extension not found.");
-    const signed = await w.signPsbt(psbtHex, { autoFinalized: true });
-    const txid   = await w.pushPsbt(signed);
-    return { txHash: txid };
-  }
-
-  if (walletId === "leather") {
-    const w = window.LeatherProvider || window.HiroWalletProvider;
-    if (!w) throw new Error("Leather extension not found.");
-    const result = await w.request("signPsbt", { hex: psbtHex, broadcast: true });
-    return { txHash: result?.result?.txid ?? result?.txid ?? "leather_" + Date.now() };
-  }
-
-  // Unknown wallet — demo fallback
-  return new Promise((r) =>
-    setTimeout(() => r({ txHash: "wallet_" + Date.now(), demo: true }), 800)
-  );
-}
-
-
-/*
- ██████╗  ██████╗ ██╗   ██╗    ███╗   ███╗ █████╗ ██████╗ ██╗  ██╗███████╗████████╗
- ██╔══██╗██╔═══██╗╚██╗ ██╔╝    ████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔════╝╚══██╔══╝
- ██████╔╝██║   ██║ ╚████╔╝     ██╔████╔██║███████║██████╔╝█████╔╝ █████╗     ██║
- ██╔═══╝ ██║   ██║  ╚██╔╝      ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ ██╔══╝     ██║
- ██║     ╚██████╔╝   ██║       ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗███████╗   ██║
- ╚═╝      ╚═════╝    ╚═╝       ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝
- Bitcoin-Native Yield NFT Marketplace — Professional Edition
-*/
-
-/* ── Google Fonts ────────────────────────────────────────────────────────── */
-const FONTS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@300;400;500;700&display=swap');`;
-
-/* ── Design Tokens ───────────────────────────────────────────────────────── */
+// ── Design tokens ─────────────────────────────────────────────────────────
 const C = {
-  primary:   "#FF9F1C",
-  secondary: "#7B2EDA",
-  bg:        "#08080F",
-  surface:   "#0F1018",
-  card:      "#141520",
-  cardHov:   "#191B2A",
-  border:    "#FFFFFF0A",
-  borderMid: "#FFFFFF16",
-  text:      "#F0ECF8",
-  muted:     "#5A5870",
-  dim:       "#3A3858",
-  success:   "#00D68F",
-  danger:    "#FF3D71",
-  accent:    "#FFB347",
-  info:      "#4D9FFF",
-  warning:   "#FFD600",
+  bg:        '#050811',
+  surface:   '#0A0F1E',
+  card:      '#0E1528',
+  cardHov:   '#131C34',
+  border:    '#1A2540',
+  borderHov: '#2A3E6A',
+  primary:   '#3B7EFF',
+  secondary: '#F5A623',
+  cbtc:      '#F7931A',
+  success:   '#00D9A3',
+  danger:    '#FF4D6A',
+  text:      '#EDF2FF',
+  muted:     '#5A6A8A',
+  faint:     '#1E2C4A',
+  glow:      'rgba(59,126,255,0.18)',
+  glowBtc:   'rgba(247,147,26,0.18)',
 };
 
-const RARITY = {
-  Legendary: { color: "#FF9F1C", glow: "#FF9F1C44", bg: "#FF9F1C0D", rank: 1, symbol: "✦" },
-  Epic:      { color: "#9B5CF6", glow: "#9B5CF644", bg: "#9B5CF60D", rank: 2, symbol: "◆" },
-  Rare:      { color: "#3B82F6", glow: "#3B82F644", bg: "#3B82F60D", rank: 3, symbol: "▲" },
-  Common:    { color: "#64748B", glow: "#64748B30", bg: "#FFFFFF07", rank: 4, symbol: "●" },
+const FONT = {
+  display: "'Syne', sans-serif",
+  body:    "'Space Grotesk', sans-serif",
+  mono:    "'JetBrains Mono', monospace",
 };
 
-/* ── Wallet Definitions ──────────────────────────────────────────────────── */
-const WALLETS = [
-  {
-    id:      "op_wallet",
-    name:    "OP_WALLET",
-    label:   "OP_WALLET",
-    tagline: "Native · MLDSA · Quantum-safe",
-    icon:    "⚡",
-    color:   "#FF9F1C",
-    badge:   "RECOMMENDED",
-    detect:  () => typeof window !== "undefined" && !!(window.opnet || window.op_wallet),
-    connect: async () => {
-      const w = window.opnet || window.op_wallet;
-      if (!w) throw new Error("OP_WALLET not installed");
-      const accounts = await w.requestAccounts();
-      const pubkey   = await w.getPublicKey();
-      const chain    = await w.getChain?.() || { network: "mainnet" };
-      return { address: accounts[0], publicKey: pubkey, network: chain.network || "mainnet", instance: w };
-    },
-  },
-  {
-    id:      "unisat",
-    name:    "UniSat",
-    label:   "UniSat",
-    tagline: "Popular · Wide support",
-    icon:    "🟠",
-    color:   "#F7931A",
-    badge:   null,
-    detect:  () => typeof window !== "undefined" && !!window.unisat,
-    connect: async () => {
-      if (!window.unisat) throw new Error("UniSat not installed");
-      const accounts = await window.unisat.requestAccounts();
-      const pubkey   = await window.unisat.getPublicKey();
-      const network  = await window.unisat.getNetwork();
-      return { address: accounts[0], publicKey: pubkey, network };
-    },
-  },
-  {
-    id:      "okx",
-    name:    "OKX Wallet",
-    label:   "OKX",
-    tagline: "Multi-chain · OKX ecosystem",
-    icon:    "⬤",
-    color:   "#FFFFFF",
-    badge:   null,
-    detect:  () => typeof window !== "undefined" && !!(window.okxwallet?.bitcoin || window.okxwallet),
-    connect: async () => {
-      const w = window.okxwallet?.bitcoin || window.okxwallet;
-      if (!w) throw new Error("OKX Wallet not installed");
-      const res      = await w.connect();
-      const address  = res.address || (Array.isArray(res) ? res[0] : "");
-      const pubkey   = res.publicKey || "";
-      return { address, publicKey: pubkey, network: "mainnet" };
-    },
-  },
-  {
-    id:      "leather",
-    name:    "Leather",
-    label:   "Leather",
-    tagline: "Stacks · Bitcoin",
-    icon:    "🟫",
-    color:   "#C4A96B",
-    badge:   null,
-    detect:  () => typeof window !== "undefined" && !!(window.LeatherProvider || window.HiroWalletProvider),
-    connect: async () => {
-      const w = window.LeatherProvider || window.HiroWalletProvider;
-      if (!w) throw new Error("Leather not installed");
-      const res = await w.request("getAddresses");
-      const btc = res?.result?.addresses?.find(a => a.type === "p2wpkh" || a.type === "p2tr");
-      return { address: btc?.address || "", publicKey: btc?.publicKey || "", network: "mainnet" };
-    },
-  },
-];
+// ── Init Loop SDK ──────────────────────────────────────────────────────────
+let loopProvider = null;
+let loopInitialized = false;
 
-/* ── NFT Dataset ─────────────────────────────────────────────────────────── */
-const NFTS = [
-  { id:1,  name:"Epoch Genesis",   num:"001", rarity:"Legendary", price:0.142, lastSale:0.130, epoch:900,  staked:50000, yield:0.211, owner:"bc1q...f8a2", creator:"SatoshiVault",  listed:true,  auction:true,  auctionEnd:Date.now()+7200000,   highBid:0.138, bids:14, likes:312, views:4821, img:"⚡", traits:[{k:"Power",v:"MAX"},{k:"Era",v:"Genesis"},{k:"Score",v:"99.2"}] },
-  { id:2,  name:"Void Miner",      num:"044", rarity:"Epic",      price:0.058, lastSale:0.051, epoch:912,  staked:22000, yield:0.087, owner:"bc1q...x9f2", creator:"NullSatoshi",   listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:189, views:2103, img:"🌑", traits:[{k:"Element",v:"Dark"},{k:"Depth",v:"Void"},{k:"Score",v:"87.1"}] },
-  { id:3,  name:"Citrus Yield",    num:"177", rarity:"Rare",      price:0.021, lastSale:0.018, epoch:918,  staked:9000,  yield:0.034, owner:"bc1q...x9f2", creator:"OrangePill",    listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:94,  views:1240, img:"🍊", traits:[{k:"Element",v:"Solar"},{k:"Flavor",v:"Citrus"},{k:"Score",v:"71.4"}] },
-  { id:4,  name:"Block Sovereign", num:"002", rarity:"Legendary", price:0.198, lastSale:0.174, epoch:895,  staked:78000, yield:0.312, owner:"bc1q...p3k1", creator:"SatoshiVault",  listed:true,  auction:true,  auctionEnd:Date.now()+3600000,   highBid:0.191, bids:22, likes:441, views:6200, img:"👑", traits:[{k:"Power",v:"APEX"},{k:"Era",v:"Genesis"},{k:"Score",v:"98.7"}] },
-  { id:5,  name:"Epoch Specter",   num:"309", rarity:"Epic",      price:0.044, lastSale:0.040, epoch:921,  staked:18000, yield:0.069, owner:"bc1q...x9f2", creator:"CryptoShade",   listed:false, auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:67,  views:890,  img:"👁",  traits:[{k:"Vision",v:"Omniscient"},{k:"Tier",v:"Specter"},{k:"Score",v:"82.3"}] },
-  { id:6,  name:"Hash Pilgrim",    num:"088", rarity:"Rare",      price:0.016, lastSale:0.014, epoch:924,  staked:7200,  yield:0.028, owner:"bc1q...mn2z", creator:"OrangePill",    listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:52,  views:710,  img:"🌊", traits:[{k:"Element",v:"Water"},{k:"Path",v:"Pilgrim"},{k:"Score",v:"68.9"}] },
-  { id:7,  name:"Neon Stake",      num:"521", rarity:"Common",    price:0.006, lastSale:0.005, epoch:926,  staked:1800,  yield:0.007, owner:"bc1q...x9f2", creator:"PlebMiner",     listed:false, auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:14,  views:201,  img:"💎", traits:[{k:"Shine",v:"Neon"},{k:"Class",v:"Stake"},{k:"Score",v:"34.1"}] },
-  { id:8,  name:"Satoshi Proof",   num:"003", rarity:"Legendary", price:0.254, lastSale:0.221, epoch:888,  staked:95000, yield:0.431, owner:"bc1q...qr9x", creator:"SatoshiVault",  listed:true,  auction:true,  auctionEnd:Date.now()+86400000,  highBid:0.248, bids:31, likes:599, views:8910, img:"₿",  traits:[{k:"Power",v:"DIVINE"},{k:"Era",v:"Pre-Genesis"},{k:"Score",v:"99.9"}] },
-  { id:9,  name:"Ultra Epoch",     num:"614", rarity:"Epic",      price:0.039, lastSale:0.035, epoch:922,  staked:15000, yield:0.058, owner:"bc1q...ab4f", creator:"NullSatoshi",   listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:78,  views:1044, img:"⬡",  traits:[{k:"Geometry",v:"Hex"},{k:"Tier",v:"Ultra"},{k:"Score",v:"80.5"}] },
-  { id:10, name:"Dust Pilgrim",    num:"802", rarity:"Common",    price:0.004, lastSale:0.004, epoch:927,  staked:800,   yield:0.003, owner:"bc1q...x9f2", creator:"PlebMiner",     listed:false, auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:8,   views:98,   img:"✦",  traits:[{k:"Dust",v:"True"},{k:"Class",v:"Pilgrim"},{k:"Score",v:"12.8"}] },
-  { id:11, name:"Proof Phantom",   num:"191", rarity:"Rare",      price:0.019, lastSale:0.016, epoch:920,  staked:8400,  yield:0.031, owner:"bc1q...zz0p", creator:"CryptoShade",   listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:103, views:1389, img:"🔮", traits:[{k:"Aura",v:"Phantom"},{k:"Proof",v:"Verified"},{k:"Score",v:"73.2"}] },
-  { id:12, name:"Epoch Flame",     num:"057", rarity:"Epic",      price:0.062, lastSale:0.057, epoch:910,  staked:24000, yield:0.096, owner:"bc1q...x9f2", creator:"OrangePill",    listed:false, auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:215, views:2804, img:"🔥", traits:[{k:"Element",v:"Fire"},{k:"Epoch",v:"Prime"},{k:"Score",v:"85.6"}] },
-  { id:13, name:"Crystal Epoch",   num:"033", rarity:"Rare",      price:0.024, lastSale:0.021, epoch:916,  staked:10500, yield:0.041, owner:"bc1q...kk7m", creator:"CryptoShade",   listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:61,  views:820,  img:"🔷", traits:[{k:"Material",v:"Crystal"},{k:"Clarity",v:"Perfect"},{k:"Score",v:"74.9"}] },
-  { id:14, name:"Solar Miner",     num:"129", rarity:"Epic",      price:0.047, lastSale:0.043, epoch:919,  staked:19500, yield:0.076, owner:"bc1q...lv9n", creator:"SatoshiVault",  listed:true,  auction:true,  auctionEnd:Date.now()+14400000,  highBid:0.044, bids:7,  likes:143, views:1932, img:"☀",  traits:[{k:"Energy",v:"Solar"},{k:"Output",v:"High"},{k:"Score",v:"83.7"}] },
-  { id:15, name:"Storm Protocol",  num:"008", rarity:"Legendary", price:0.174, lastSale:0.160, epoch:891,  staked:65000, yield:0.271, owner:"bc1q...mm3p", creator:"NullSatoshi",   listed:true,  auction:false, auctionEnd:null,                  highBid:null,  bids:0,  likes:387, views:5600, img:"⚡", traits:[{k:"Power",v:"STORM"},{k:"Protocol",v:"Genesis"},{k:"Score",v:"97.4"}] },
-];
+function initLoop(onAccept, onReject) {
+  if (loopInitialized) return;
+  loopInitialized = true;
+  loop.init({
+    appName: 'PoY Market',
+    network: 'mainnet',
+    options: { openMode: 'popup', requestSigningMode: 'popup' },
+    onAccept: (provider) => {
+      loopProvider = provider;
+      onAccept(provider);
+    },
+    onReject: () => {
+      loopProvider = null;
+      onReject();
+    },
+    onTransactionUpdate: (payload) => {
+      console.log('[Canton] tx update:', payload);
+    },
+  });
+}
 
-const CREATORS = {
-  "SatoshiVault": { name:"SatoshiVault",  verified:true,  avatar:"₿",  volume:"4.2 BTC", sales:28, color:C.primary   },
-  "NullSatoshi":  { name:"NullSatoshi",   verified:true,  avatar:"🌑", volume:"1.8 BTC", sales:14, color:"#9B5CF6"   },
-  "OrangePill":   { name:"OrangePill",    verified:true,  avatar:"🍊", volume:"0.9 BTC", sales:19, color:C.accent    },
-  "CryptoShade":  { name:"CryptoShade",   verified:false, avatar:"👁", volume:"0.6 BTC", sales:11, color:"#9B5CF6"   },
-  "PlebMiner":    { name:"PlebMiner",     verified:false, avatar:"⛏", volume:"0.1 BTC", sales:7,  color:C.muted     },
+// ── Tiny helpers ──────────────────────────────────────────────────────────
+const fmt = (n, d = 2) => Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const fmtBtc = (n) => Number(n).toFixed(8);
+const ago = (ms) => {
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  return `${Math.floor(s/3600)}h ago`;
 };
+const shortId = (id = '') => id.slice(0, 6) + '…' + id.slice(-4);
 
-const TICKER_ITEMS = [
-  { type:"SALE",  nft:"Epoch Genesis #001",   price:"0.1300", color:C.success  },
-  { type:"BID",   nft:"Satoshi Proof #003",   price:"0.2480", color:C.primary  },
-  { type:"MINT",  nft:"Dust Pilgrim #802",    price:"—",      color:C.info     },
-  { type:"LIST",  nft:"Crystal Epoch #033",   price:"0.0240", color:C.accent   },
-  { type:"SALE",  nft:"Hash Pilgrim #088",    price:"0.0140", color:C.success  },
-  { type:"OFFER", nft:"Void Miner #044",      price:"0.0520", color:"#9B5CF6"  },
-  { type:"BID",   nft:"Solar Miner #129",     price:"0.0440", color:C.primary  },
-  { type:"SALE",  nft:"Block Sovereign #002", price:"0.1740", color:C.success  },
-];
-
-/* ── Hooks ───────────────────────────────────────────────────────────────── */
-function useCountdown(endMs) {
-  const calc = useCallback(() => {
-    const left = Math.max(0, (endMs || 0) - Date.now());
-    return {
-      h: Math.floor(left / 3600000),
-      m: Math.floor((left % 3600000) / 60000),
-      s: Math.floor((left % 60000) / 1000),
-      expired: left === 0,
-    };
-  }, [endMs]);
-
-  const [state, setState] = useState(calc);
-  useEffect(() => {
-    if (!endMs) return;
-    setState(calc());
-    const t = setInterval(() => setState(calc()), 1000);
-    return () => clearInterval(t);
-  }, [endMs, calc]);
-  return state;
+// ── Reusable components ───────────────────────────────────────────────────
+function Mono({ children, size = 12, color = C.muted, style = {} }) {
+  return <span style={{ fontFamily: FONT.mono, fontSize: size, color, ...style }}>{children}</span>;
 }
 
-function useTilt(ref) {
-  const [tilt, setTilt] = useState({ rx: 0, ry: 0, gx: 50, gy: 50 });
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const onMove = (e) => {
-      const r = el.getBoundingClientRect();
-      const nx = ((e.clientX - r.left) / r.width  - 0.5) * 16;
-      const ny = ((e.clientY - r.top)  / r.height - 0.5) * -16;
-      const gx = ((e.clientX - r.left) / r.width)  * 100;
-      const gy = ((e.clientY - r.top)  / r.height) * 100;
-      setTilt({ rx: nx, ry: ny, gx, gy });
-    };
-    const onLeave = () => setTilt({ rx: 0, ry: 0, gx: 50, gy: 50 });
-    el.addEventListener("mousemove", onMove);
-    el.addEventListener("mouseleave", onLeave);
-    return () => {
-      el.removeEventListener("mousemove", onMove);
-      el.removeEventListener("mouseleave", onLeave);
-    };
-  }, []);
-  return tilt;
-}
-
-function usePriceHistory(seed) {
-  return useMemo(() => {
-    const pts = [seed * 0.72];
-    for (let i = 1; i < 10; i++) {
-      pts.push(Math.max(0.001, pts[i - 1] * (0.88 + Math.random() * 0.26)));
-    }
-    return pts;
-  }, [seed]); // eslint-disable-line react-hooks/exhaustive-deps
-}
-
-/* ── Micro Components ────────────────────────────────────────────────────── */
-function RarityBadge({ rarity, tiny = false }) {
-  const r = RARITY[rarity] || RARITY.Common;
+function Tag({ children, color = C.primary, style = {} }) {
   return (
     <span style={{
-      display: "inline-flex", alignItems: "center", gap: 3,
-      background: r.bg, color: r.color,
-      border: `1px solid ${r.color}44`,
-      borderRadius: 20, padding: tiny ? "2px 7px" : "4px 11px",
-      fontSize: tiny ? 9 : 10, fontWeight: 700,
-      letterSpacing: "0.09em", textTransform: "uppercase",
-      fontFamily: "'JetBrains Mono', monospace", whiteSpace: "nowrap",
-    }}>
-      <span style={{ fontSize: tiny ? 7 : 9 }}>{r.symbol}</span>
-      {rarity}
-    </span>
+      background: color + '18', color,
+      border: `1px solid ${color}33`,
+      borderRadius: 4, padding: '2px 7px',
+      fontSize: 9, fontWeight: 700, letterSpacing: '0.08em',
+      fontFamily: FONT.mono, ...style,
+    }}>{children}</span>
   );
 }
 
-function Mono({ children, size = 13, color = C.text, weight = 400, style: extraStyle }) {
-  return (
-    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: size, color, fontWeight: weight, ...extraStyle }}>
-      {children}
-    </span>
-  );
-}
-
-function BtcPrice({ value, size = 14, dimColor }) {
-  if (value == null) return <Mono size={size} color={C.muted}>—</Mono>;
-  return (
-    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: size, color: dimColor || C.text }}>
-      <span style={{ color: C.primary, marginRight: 2, fontSize: size * 0.78 }}>₿</span>
-      {Number(value).toFixed(4)}
-    </span>
-  );
-}
-
-function Sparkline({ data, w = 72, h = 28, color = C.primary }) {
-  if (!data || data.length < 2) return null;
-  const min = Math.min(...data);
-  const max = Math.max(...data);
-  const rng = max - min || 0.001;
-  const px = data.map((v, i) => (i / (data.length - 1)) * w);
-  const py = data.map((v) => h - ((v - min) / rng) * (h - 4) + 2);
-  const linePts = data.map((_, i) => `${px[i]},${py[i]}`).join(" ");
-  const areaPts = `0,${h} ${linePts} ${w},${h}`;
-  const uid = `sp-${color.replace(/[^a-z0-9]/gi, "")}-${w}`;
-  return (
-    <svg width={w} height={h} style={{ overflow: "visible", display: "block", flexShrink: 0 }}>
-      <defs>
-        <linearGradient id={uid} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <polygon fill={`url(#${uid})`} points={areaPts} />
-      <polyline fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" points={linePts} />
-      <circle cx={px[px.length - 1]} cy={py[py.length - 1]} r="2.5" fill={color} />
-    </svg>
-  );
-}
-
-function CountdownInline({ endMs }) {
-  const { h, m, s, expired } = useCountdown(endMs);
-  if (expired) return <Mono size={11} color={C.danger}>ENDED</Mono>;
-  return (
-    <span style={{ display: "inline-flex", gap: 3, alignItems: "center" }}>
-      {[["h", h], ["m", m], ["s", s]].map(([l, v]) => (
-        <span key={l} style={{ background: C.surface, borderRadius: 4, padding: "2px 5px", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.accent }}>
-          {String(v).padStart(2, "0")}<span style={{ color: C.muted, fontSize: 8 }}>{l}</span>
-        </span>
-      ))}
-    </span>
-  );
-}
-
-/* ── NFT Canvas Art ──────────────────────────────────────────────────────── */
-function NFTCanvas({ nft, size = 220 }) {
-  const canvasRef = useRef(null);
-  const r = RARITY[nft.rarity] || RARITY.Common;
-
-  useEffect(() => {
-    const cvs = canvasRef.current;
-    if (!cvs) return;
-    const ctx = cvs.getContext("2d");
-    if (!ctx) return;
-    const W = size * 2;
-    const H = size * 2;
-    cvs.width = W;
-    cvs.height = H;
-    ctx.scale(2, 2);
-    const w = size;
-    const h = size;
-
-    // Background
-    const bg = ctx.createLinearGradient(0, 0, w, h);
-    bg.addColorStop(0, "#09090F");
-    bg.addColorStop(1, "#0D0D1C");
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, w, h);
-
-    // Dot grid
-    ctx.fillStyle = r.color + "16";
-    for (let x = 8; x < w; x += 14) {
-      for (let y = 8; y < h; y += 14) {
-        ctx.beginPath();
-        ctx.arc(x, y, 0.7, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-
-    // Outer glow
-    const glow = ctx.createRadialGradient(w / 2, h / 2, w * 0.2, w / 2, h / 2, w * 0.52);
-    glow.addColorStop(0, r.color + "28");
-    glow.addColorStop(0.6, r.color + "10");
-    glow.addColorStop(1, "transparent");
-    ctx.fillStyle = glow;
-    ctx.fillRect(0, 0, w, h);
-
-    // Hexagon
-    const hexR = w * 0.38;
-    ctx.save();
-    ctx.translate(w / 2, h / 2);
-    ctx.beginPath();
-    for (let i = 0; i <= 6; i++) {
-      const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
-      const x2 = Math.cos(a) * hexR;
-      const y2 = Math.sin(a) * hexR;
-      i === 0 ? ctx.moveTo(x2, y2) : ctx.lineTo(x2, y2);
-    }
-    ctx.closePath();
-    const hexGrad = ctx.createLinearGradient(-hexR, -hexR, hexR, hexR);
-    hexGrad.addColorStop(0, r.color + "BB");
-    hexGrad.addColorStop(1, r.color + "44");
-    ctx.strokeStyle = hexGrad;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    // Inner hex
-    const hexR2 = hexR * 0.72;
-    ctx.beginPath();
-    for (let i = 0; i <= 6; i++) {
-      const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
-      i === 0 ? ctx.moveTo(Math.cos(a) * hexR2, Math.sin(a) * hexR2) : ctx.lineTo(Math.cos(a) * hexR2, Math.sin(a) * hexR2);
-    }
-    ctx.closePath();
-    ctx.strokeStyle = r.color + "30";
-    ctx.lineWidth = 0.8;
-    ctx.stroke();
-
-    // Corner dots
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
-      ctx.beginPath();
-      ctx.arc(Math.cos(a) * hexR, Math.sin(a) * hexR, 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = r.color + "CC";
-      ctx.fill();
-    }
-    ctx.restore();
-
-    // Emoji
-    ctx.font = `${w * 0.26}px serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.shadowColor = r.color;
-    ctx.shadowBlur = 20;
-    ctx.fillText(nft.img, w / 2, h / 2 + 2);
-    ctx.shadowBlur = 0;
-
-    // Token number watermark
-    ctx.fillStyle = r.color + "66";
-    ctx.font = `500 ${w * 0.048}px 'JetBrains Mono', monospace`;
-    ctx.textAlign = "right";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(`#${nft.num}`, w - 9, h - 9);
-
-    // Creator badge
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.beginPath();
-    ctx.roundRect(8, h - 26, Math.min(nft.creator.length * 7 + 14, 100), 18, 4);
-    ctx.fill();
-    ctx.fillStyle = r.color + "CC";
-    ctx.font = `600 ${w * 0.042}px 'JetBrains Mono', monospace`;
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.fillText(nft.creator, 13, h - 17);
-  }, [nft, size, r]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      style={{ display: "block", width: size, height: size, borderRadius: 12, imageRendering: "crisp-edges" }}
-    />
-  );
-}
-
-/* ── NFT Card with 3D Tilt ───────────────────────────────────────────────── */
-function NFTCard({ nft, onOpen, compact = false }) {
-  const ref = useRef(null);
-  const tilt = useTilt(ref);
-  const priceHist = usePriceHistory(nft.lastSale);
-  const [liked, setLiked] = useState(false);
+function Btn({ children, onClick, disabled, variant = 'primary', size = 'md', style = {} }) {
   const [hov, setHov] = useState(false);
-  const r = RARITY[nft.rarity] || RARITY.Common;
-  const sz = compact ? 180 : 220;
+  const sizes = { sm: '7px 16px', md: '10px 22px', lg: '13px 32px' };
+  const base = {
+    border: 'none', borderRadius: 8, cursor: disabled ? 'not-allowed' : 'pointer',
+    fontFamily: FONT.body, fontWeight: 600, letterSpacing: '0.02em',
+    padding: sizes[size], fontSize: size === 'sm' ? 12 : size === 'lg' ? 15 : 13,
+    opacity: disabled ? 0.45 : 1, transition: 'all 0.15s',
+    transform: hov && !disabled ? 'translateY(-1px)' : 'none',
+  };
+  const variants = {
+    primary: { background: hov ? '#5B9EFF' : C.primary, color: '#fff', boxShadow: hov ? `0 6px 24px ${C.glow}` : 'none' },
+    secondary: { background: hov ? '#FFB94D' : C.secondary, color: '#050811' },
+    ghost: { background: hov ? C.faint : 'transparent', color: C.text, border: `1px solid ${C.border}` },
+    danger: { background: hov ? '#FF7090' : C.danger, color: '#fff' },
+    cbtc: { background: hov ? '#FFB03A' : C.cbtc, color: '#050811' },
+  };
+  return (
+    <button
+      onClick={disabled ? undefined : onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{ ...base, ...variants[variant], ...style }}
+    >{children}</button>
+  );
+}
 
-  const handleLike = useCallback((e) => {
-    e.stopPropagation();
-    setLiked((prev) => !prev);
-  }, []);
-
-  const handleOpen = useCallback((e) => {
-    e.stopPropagation();
-    onOpen(nft);
-  }, [nft, onOpen]);
-
+function Card({ children, style = {}, glow = false }) {
+  const [hov, setHov] = useState(false);
   return (
     <div
-      ref={ref}
-      onClick={() => onOpen(nft)}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{
-        cursor: "pointer",
-        borderRadius: 20,
         background: hov ? C.cardHov : C.card,
-        border: `1px solid ${hov ? r.color + "55" : C.border}`,
-        overflow: "hidden",
-        transform: `perspective(900px) rotateY(${tilt.rx}deg) rotateX(${tilt.ry}deg) scale(${hov ? 1.016 : 1})`,
-        transition: "transform 0.12s ease, box-shadow 0.25s, border-color 0.25s, background 0.2s",
-        boxShadow: hov ? `0 18px 50px ${r.glow}, 0 4px 16px #00000066` : "0 2px 14px #00000055",
-        willChange: "transform",
-        position: "relative",
+        border: `1px solid ${hov ? C.borderHov : C.border}`,
+        borderRadius: 16,
+        transition: 'all 0.2s',
+        boxShadow: glow && hov ? `0 8px 40px ${C.glow}` : 'none',
+        ...style,
       }}
-    >
-      {/* Tilt shine */}
-      <div
-        style={{
-          position: "absolute", inset: 0, zIndex: 10, pointerEvents: "none", borderRadius: 20,
-          background: hov
-            ? `radial-gradient(circle at ${tilt.gx}% ${tilt.gy}%, #ffffff08 0%, transparent 60%)`
-            : "none",
-          transition: "background 0.1s",
-        }}
-      />
+    >{children}</div>
+  );
+}
 
-      {/* Art section */}
-      <div style={{ position: "relative", background: "#09090F", lineHeight: 0 }}>
-        <NFTCanvas nft={nft} size={sz} />
-
-        {/* Auction badge */}
-        {nft.auction && (
-          <div style={{
-            position: "absolute", top: 10, left: 10, zIndex: 5,
-            background: `linear-gradient(90deg, ${C.primary}EE, ${C.secondary}EE)`,
-            borderRadius: 20, padding: "3px 10px",
-            fontSize: 9, fontWeight: 800, color: "#fff", letterSpacing: "0.1em",
-            fontFamily: "'JetBrains Mono', monospace",
-          }}>⏱ AUCTION</div>
-        )}
-
-        {/* Rarity badge */}
-        <div style={{ position: "absolute", top: 10, right: 10, zIndex: 5 }}>
-          <RarityBadge rarity={nft.rarity} tiny />
-        </div>
-
-        {/* Hover overlay */}
-        <div style={{
-          position: "absolute", inset: 0, zIndex: 6,
-          display: "flex", alignItems: "flex-end", justifyContent: "center",
-          background: `linear-gradient(to top, ${C.bg}EE 0%, ${C.bg}44 40%, transparent 70%)`,
-          paddingBottom: 14, opacity: hov ? 1 : 0, transition: "opacity 0.2s",
-          pointerEvents: hov ? "auto" : "none",
-        }}>
-          <button onClick={handleOpen} style={{
-            background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`,
-            border: "none", borderRadius: 30, padding: "9px 24px",
-            color: "#fff", fontWeight: 800, fontSize: 12, cursor: "pointer",
-            fontFamily: "inherit", letterSpacing: "0.04em",
-            boxShadow: `0 4px 18px ${C.primary}55`,
-          }}>
-            {nft.auction ? "Place Bid" : nft.listed ? "Buy Now" : "View"}
-          </button>
-        </div>
-
-        {/* Like button */}
-        <button
-          onClick={handleLike}
-          style={{
-            position: "absolute", bottom: 10, right: 10, zIndex: 7,
-            background: "rgba(0,0,0,0.65)", backdropFilter: "blur(8px)",
-            border: `1px solid ${liked ? C.danger + "66" : "#ffffff12"}`,
-            borderRadius: 20, padding: "4px 9px", cursor: "pointer",
-            display: "flex", alignItems: "center", gap: 4,
-            color: liked ? C.danger : C.muted, fontSize: 11, fontFamily: "inherit",
-            transition: "all 0.2s",
-          }}
-        >
-          <span style={{ fontSize: 10 }}>{liked ? "♥" : "♡"}</span>
-          <Mono size={10} color={liked ? C.danger : C.muted}>{nft.likes + (liked ? 1 : 0)}</Mono>
-        </button>
-      </div>
-
-      {/* Info */}
-      <div style={{ padding: compact ? "10px 12px 13px" : "13px 15px 16px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 7 }}>
-          <div style={{ minWidth: 0, flex: 1, marginRight: 8 }}>
-            <div style={{ fontSize: compact ? 12 : 14, fontWeight: 700, color: C.text, lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {nft.name}
-            </div>
-            <Mono size={10} color={C.muted}>#{nft.num} · E{nft.epoch}</Mono>
-          </div>
-          <Sparkline data={priceHist} w={56} h={22} color={r.color} />
-        </div>
-
-        {nft.auction && nft.auctionEnd && (
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7, background: `${C.primary}0A`, borderRadius: 8, padding: "5px 9px" }}>
-            <span style={{ fontSize: 9, color: C.muted, letterSpacing: "0.07em" }}>ENDS IN</span>
-            <CountdownInline endMs={nft.auctionEnd} />
-          </div>
-        )}
-
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
-          <div>
-            <div style={{ fontSize: 9, color: C.muted, marginBottom: 3, letterSpacing: "0.06em" }}>
-              {nft.auction ? "TOP BID" : nft.listed ? "LIST PRICE" : "LAST SALE"}
-            </div>
-            <BtcPrice value={nft.auction ? nft.highBid : nft.listed ? nft.price : nft.lastSale} size={compact ? 13 : 15} />
-          </div>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: 9, color: C.muted, marginBottom: 3 }}>YIELD</div>
-            <Mono size={11} color={C.success}>+{nft.yield.toFixed(3)}</Mono>
-          </div>
-        </div>
-
-        {(nft.listed || nft.auction) && (
-          <button
-            onClick={handleOpen}
-            style={{
-              width: "100%", marginTop: 10,
-              background: "transparent",
-              border: `1px solid ${r.color}55`,
-              borderRadius: 30, padding: "8px 0",
-              color: r.color, fontWeight: 700, fontSize: 12,
-              cursor: "pointer", fontFamily: "inherit",
-              transition: "all 0.18s",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.background = `linear-gradient(90deg,${C.primary},${C.secondary})`;
-              e.currentTarget.style.color = "#fff";
-              e.currentTarget.style.border = "1px solid transparent";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "transparent";
-              e.currentTarget.style.color = r.color;
-              e.currentTarget.style.border = `1px solid ${r.color}55`;
-            }}
-          >
-            {nft.auction ? `Bid · ₿${nft.price.toFixed(4)}` : `Buy · ₿${nft.price.toFixed(4)}`}
-          </button>
-        )}
-      </div>
+function StatusBar({ state, msg }) {
+  if (!msg || state === 'idle') return null;
+  const colors = { pending: C.primary, success: C.success, error: C.danger };
+  return (
+    <div style={{
+      margin: '10px 0', padding: '8px 14px', borderRadius: 8, fontSize: 12,
+      background: (colors[state] || C.primary) + '18',
+      color: colors[state] || C.primary,
+      border: `1px solid ${(colors[state] || C.primary)}33`,
+      fontFamily: FONT.mono,
+    }}>
+      {state === 'pending' && '⏳ '}{state === 'success' && '✓ '}{state === 'error' && '✗ '}{msg}
     </div>
   );
 }
 
-/* ── Wallet Connect Modal ────────────────────────────────────────────────── */
+// ── NFT Canvas (geometric art) ────────────────────────────────────────────
+function NFTCanvas({ nft, size = 200 }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    const w = size, h = size;
+    ctx.clearRect(0, 0, w, h);
+    // Background
+    const bg = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, w/1.4);
+    bg.addColorStop(0, nft.rarityColor + '22');
+    bg.addColorStop(1, '#050811');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+    // Grid lines
+    ctx.strokeStyle = nft.rarityColor + '18';
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i < 6; i++) {
+      ctx.beginPath(); ctx.moveTo(i * w/5, 0); ctx.lineTo(i * w/5, h); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, i * h/5); ctx.lineTo(w, i * h/5); ctx.stroke();
+    }
+    // Hexagon
+    const r = w * 0.28;
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = (Math.PI / 3) * i - Math.PI / 6;
+      const x = w/2 + r * Math.cos(a), y = h/2 + r * Math.sin(a);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = nft.rarityColor + 'AA';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Inner hex
+    const r2 = w * 0.16;
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = (Math.PI / 3) * i - Math.PI / 6;
+      const x = w/2 + r2 * Math.cos(a), y = h/2 + r2 * Math.sin(a);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    const fill = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, r2);
+    fill.addColorStop(0, nft.rarityColor + '55');
+    fill.addColorStop(1, nft.rarityColor + '11');
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.stroke();
+    // Center glyph
+    ctx.font = `${w * 0.18}px ${FONT.mono}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = nft.rarityColor + 'DD';
+    ctx.fillText(nft.art, w/2, h/2);
+    // Epoch badge
+    ctx.font = `600 ${w * 0.07}px ${FONT.body}`;
+    ctx.fillStyle = C.muted;
+    ctx.fillText(`E${nft.epoch}`, w/2, h * 0.82);
+  }, [nft, size]);
+  return <canvas ref={canvasRef} width={size} height={size} style={{ display: 'block' }} />;
+}
+
+// ── Wallet Connect Modal ──────────────────────────────────────────────────
 function WalletModal({ onClose, onConnected }) {
-  const [connecting, setConnecting] = useState(null);
-  const [error, setError] = useState("");
-  const [walletStates, setWalletStates] = useState({});
+  const [state, setState] = useState('idle'); // idle | connecting | error
+  const [err, setErr] = useState('');
 
-  useEffect(() => {
-    // Detect installed wallets
-    const states = {};
-    WALLETS.forEach((w) => {
-      states[w.id] = w.detect();
-    });
-    setWalletStates(states);
-  }, []);
-
-  useEffect(() => {
-    document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = ""; };
-  }, []);
-
-  const handleConnect = useCallback(async (wallet) => {
-    setError("");
-    setConnecting(wallet.id);
+  const handleConnect = useCallback(async () => {
+    setState('connecting');
+    setErr('');
     try {
-      const result = await wallet.connect();
-      onConnected({
-        address:   result.address   || "bc1q...demo",
-        publicKey: result.publicKey || "",
-        network:   result.network   || "mainnet",
-        walletId:  wallet.id,
-        walletName: wallet.label,
-        walletIcon: wallet.icon,
-        walletColor: wallet.color,
-      });
-      onClose();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("not installed")) {
-        setError(`${wallet.label} extension not found. Please install it first.`);
-      } else if (msg.includes("User rejected") || msg.includes("cancelled")) {
-        setError("Connection rejected by user.");
-      } else {
-        // Demo mode fallback
-        onConnected({
-          address:    `bc1q...${wallet.id.slice(0, 4)}`,
-          publicKey:  "demo",
-          network:    "mainnet",
-          walletId:   wallet.id,
-          walletName: wallet.label,
-          walletIcon: wallet.icon,
-          walletColor: wallet.color,
-        });
-        onClose();
-      }
-    } finally {
-      setConnecting(null);
+      initLoop(
+        (provider) => {
+          connectWallet(provider);
+          onConnected({ provider, partyId: provider.party_id, email: provider.email });
+          onClose();
+        },
+        () => { setState('idle'); setErr('Connection rejected. Please try again.'); }
+      );
+      loop.connect();
+    } catch (e) {
+      setState('error');
+      setErr(e.message || 'Failed to connect');
     }
   }, [onClose, onConnected]);
 
   return (
-    <div
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(8,8,15,0.88)", backdropFilter: "blur(20px)", display: "flex", alignItems: typeof window !== "undefined" && window.innerWidth < 640 ? "flex-end" : "center", justifyContent: "center", padding: typeof window !== "undefined" && window.innerWidth < 640 ? 0 : 24 }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: C.surface, border: `1px solid ${C.borderMid}`,
-          borderRadius: typeof window !== "undefined" && window.innerWidth < 640 ? "20px 20px 0 0" : 24,
-          width: "100%", maxWidth: 440,
-          boxShadow: `0 32px 80px #00000099`,
-          animation: "mIn 0.25s cubic-bezier(0.34,1.56,0.64,1)",
-          overflow: "hidden",
-        }}
-      >
-        {/* Header */}
-        <div style={{ padding: "24px 28px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
-            <h2 style={{ fontSize: 20, fontWeight: 800, color: C.text, margin: "0 0 4px" }}>Connect Wallet</h2>
-            <p style={{ fontSize: 12, color: C.muted, margin: 0 }}>Choose your Bitcoin wallet to continue</p>
-          </div>
-          <button onClick={onClose} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 32, height: 32, cursor: "pointer", color: C.muted, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+    <div onClick={onClose} style={{
+      position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(5,8,17,0.92)',
+      backdropFilter: 'blur(20px)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20,
+        padding: '36px 40px', width: '100%', maxWidth: 420, textAlign: 'center',
+      }}>
+        {/* Loop logo */}
+        <div style={{ fontSize: 52, marginBottom: 12 }}>⟳</div>
+        <h2 style={{ fontFamily: FONT.display, fontSize: 24, fontWeight: 800, color: C.text, marginBottom: 8 }}>
+          Connect Loop Wallet
+        </h2>
+        <p style={{ color: C.muted, fontSize: 13, marginBottom: 24, lineHeight: 1.6 }}>
+          Canton Loop is the first non-custodial wallet on Canton Network.<br />
+          Scan the QR code with your Loop app to connect.
+        </p>
+
+        <div style={{ background: C.faint, border: `1px solid ${C.border}`, borderRadius: 12, padding: '12px 16px', marginBottom: 24, textAlign: 'left' }}>
+          {[
+            ['Network', 'Canton Mainnet'],
+            ['Token', 'CC (Canton Coin / Amulet)'],
+            ['Yield', 'CBTC (Simulated)'],
+            ['SDK', '@fivenorth/loop-sdk v0.8'],
+          ].map(([k, v]) => (
+            <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: `1px solid ${C.border}` }}>
+              <Mono color={C.muted}>{k}</Mono>
+              <Mono color={C.text}>{v}</Mono>
+            </div>
+          ))}
         </div>
 
-        {/* Wallet list */}
-        <div style={{ padding: "20px 28px 28px", display: "flex", flexDirection: "column", gap: 10 }}>
-          {WALLETS.map((w) => {
-            const installed = walletStates[w.id];
-            const isConnecting = connecting === w.id;
-            return (
-              <button
-                key={w.id}
-                onClick={() => handleConnect(w)}
-                disabled={isConnecting}
-                style={{
-                  display: "flex", alignItems: "center", gap: 14,
-                  background: isConnecting ? `${w.color}11` : C.card,
-                  border: `1px solid ${isConnecting ? w.color + "66" : C.border}`,
-                  borderRadius: 14, padding: "14px 18px",
-                  cursor: isConnecting ? "wait" : "pointer",
-                  transition: "all 0.2s", textAlign: "left", width: "100%",
-                  fontFamily: "inherit",
-                }}
-                onMouseEnter={(e) => {
-                  if (!isConnecting) {
-                    e.currentTarget.style.borderColor = w.color + "66";
-                    e.currentTarget.style.background = w.color + "0D";
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (!isConnecting) {
-                    e.currentTarget.style.borderColor = C.border;
-                    e.currentTarget.style.background = C.card;
-                  }
-                }}
-              >
-                {/* Icon */}
-                <div style={{
-                  width: 44, height: 44, borderRadius: 12, flexShrink: 0,
-                  background: `${w.color}18`, border: `1px solid ${w.color}44`,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  fontSize: 20,
-                }}>
-                  {isConnecting ? (
-                    <span style={{ fontSize: 16, animation: "spin 0.8s linear infinite", display: "inline-block" }}>⟳</span>
-                  ) : w.icon}
-                </div>
+        {err && <div style={{ color: C.danger, fontSize: 12, marginBottom: 16, fontFamily: FONT.mono }}>{err}</div>}
 
-                {/* Text */}
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{w.label}</span>
-                    {w.badge && (
-                      <span style={{ background: `${C.primary}22`, color: C.primary, border: `1px solid ${C.primary}44`, borderRadius: 20, padding: "1px 8px", fontSize: 9, fontWeight: 800, letterSpacing: "0.1em", fontFamily: "'JetBrains Mono', monospace" }}>
-                        {w.badge}
-                      </span>
-                    )}
-                    {!installed && (
-                      <span style={{ background: `${C.muted}15`, color: C.muted, borderRadius: 20, padding: "1px 7px", fontSize: 9, letterSpacing: "0.06em", fontFamily: "'JetBrains Mono', monospace" }}>
-                        NOT INSTALLED
-                      </span>
-                    )}
-                  </div>
-                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{w.tagline}</div>
-                </div>
+        {state === 'connecting' ? (
+          <div style={{ color: C.primary, fontSize: 13, fontFamily: FONT.mono, padding: 16 }}>
+            ⏳ Opening Loop wallet… scan the QR code
+          </div>
+        ) : (
+          <Btn onClick={handleConnect} variant="primary" size="lg" style={{ width: '100%', marginBottom: 12 }}>
+            Connect with Loop
+          </Btn>
+        )}
 
-                {/* Installed indicator */}
-                {installed && (
-                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: C.success, boxShadow: `0 0 6px ${C.success}`, flexShrink: 0 }} />
-                )}
+        <p style={{ color: C.muted, fontSize: 11, marginTop: 12 }}>
+          Don't have Loop?{' '}
+          <a href="https://cantonloop.com" target="_blank" rel="noreferrer"
+            style={{ color: C.primary, textDecoration: 'none' }}>Get it here →</a>
+        </p>
+      </div>
+    </div>
+  );
+}
 
-                {isConnecting && (
-                  <span style={{ fontSize: 11, color: w.color, fontFamily: "'JetBrains Mono', monospace" }}>Connecting…</span>
-                )}
-              </button>
-            );
-          })}
+// ── Stake Modal ───────────────────────────────────────────────────────────
+function StakeModal({ onClose, onSuccess }) {
+  const [amount, setAmount] = useState('');
+  const [state, setState] = useState('idle');
+  const [msg, setMsg] = useState('');
+  const num = parseFloat(amount) || 0;
+  const tier = num >= STAKING_CONFIG.minStake ? getTier(num) : null;
 
-          {error && (
-            <div style={{ background: `${C.danger}11`, border: `1px solid ${C.danger}44`, borderRadius: 10, padding: "10px 14px", fontSize: 12, color: C.danger }}>
-              ⚠ {error}
-            </div>
-          )}
+  const handle = async () => {
+    if (!num || num < STAKING_CONFIG.minStake) return;
+    setState('pending'); setMsg('Submitting stake to Canton ledger…');
+    await new Promise(r => setTimeout(r, 1400));
+    try {
+      const stake = stakeCC(num);
+      setState('success'); setMsg(`Staked ${num} CC successfully! Stake ID: ${stake.id}`);
+      setTimeout(() => { onSuccess(stake); onClose(); }, 2000);
+    } catch (e) {
+      setState('error'); setMsg(e.message);
+      setTimeout(() => setState('idle'), 3000);
+    }
+  };
 
-          <p style={{ fontSize: 11, color: C.muted, textAlign: "center", margin: "8px 0 0", lineHeight: 1.6 }}>
-            By connecting, you agree to our{" "}
-            <span style={{ color: C.primary, cursor: "pointer" }}>Terms of Service</span> and{" "}
-            <span style={{ color: C.primary, cursor: "pointer" }}>Privacy Policy</span>
-          </p>
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 1800, background: 'rgba(5,8,17,0.9)', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, padding: 36, width: '100%', maxWidth: 460 }}>
+        <h2 style={{ fontFamily: FONT.display, fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6 }}>Stake CC</h2>
+        <p style={{ color: C.muted, fontSize: 13, marginBottom: 24 }}>Stake Canton Coin to earn CBTC yield and mint a Yield NFT.</p>
+
+        <div style={{ marginBottom: 18 }}>
+          <label style={{ fontSize: 11, color: C.muted, display: 'block', marginBottom: 6, letterSpacing: '0.08em' }}>AMOUNT (CC)</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              value={amount} onChange={e => setAmount(e.target.value)} type="number" min="10" step="10"
+              placeholder={`Min ${STAKING_CONFIG.minStake} CC`}
+              style={{ flex: 1, background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 14px', color: C.text, fontSize: 14, fontFamily: FONT.mono, outline: 'none' }}
+            />
+            <Btn onClick={() => setAmount(String(Math.floor(ledger.ccBalance)))} variant="ghost" size="sm">MAX</Btn>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6 }}>
+            <Mono>Balance: {fmt(ledger.ccBalance)} CC</Mono>
+            {tier && <Tag color={tier.rarityColor}>{tier.rarityLabel}</Tag>}
+          </div>
+        </div>
+
+        {tier && (
+          <div style={{ background: C.faint, borderRadius: 10, padding: 14, marginBottom: 18, border: `1px solid ${C.border}` }}>
+            {[
+              ['Tier', tier.label],
+              ['CBTC APY', `${tier.cbTcAPY}%`],
+              ['Rarity', tier.rarityLabel],
+            ].map(([k, v]) => (
+              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0' }}>
+                <Mono color={C.muted}>{k}</Mono>
+                <Mono color={C.text}>{v}</Mono>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <StatusBar state={state} msg={msg} />
+        {/* Tier quick-select */}
+        <div style={{ display: 'flex', gap: 6, marginBottom: 18, flexWrap: 'wrap' }}>
+          {STAKING_CONFIG.tiers.map(t => (
+            <button key={t.label} onClick={() => setAmount(String(t.minCC))}
+              style={{ background: C.faint, border: `1px solid ${t.rarityColor}44`, borderRadius: 6, padding: '5px 10px', color: t.rarityColor, fontSize: 11, cursor: 'pointer', fontFamily: FONT.body, fontWeight: 600 }}>
+              {t.label} {t.minCC}+
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <Btn onClick={handle} disabled={!num || num < STAKING_CONFIG.minStake || state === 'pending'} variant="primary" style={{ flex: 1 }}>
+            {state === 'pending' ? 'Staking…' : 'Stake CC'}
+          </Btn>
+          <Btn onClick={onClose} variant="ghost">Cancel</Btn>
         </div>
       </div>
     </div>
   );
 }
 
-/* ── NFT Detail Modal ────────────────────────────────────────────────────── */
-function NFTModal({ nft, onClose, wallet, onOpenWallet, onToast }) {
-  const [mTab, setMTab] = useState("details");
-  const [bidAmt, setBidAmt] = useState("");
-  const [bidPlaced, setBidPlaced] = useState(false);
-  const [wishlisted, setWishlisted] = useState(false);
-  const [txState, setTxState] = useState("idle"); // idle | pending | success | error
-  const [txMsg, setTxMsg] = useState("");
-  const priceHist = usePriceHistory(nft.lastSale);
-  const r = RARITY[nft.rarity] || RARITY.Common;
-  const creator = CREATORS[nft.creator];
-  const { isMobile } = useBreakpoint();
+// ── NFT Detail Modal ───────────────────────────────────────────────────────
+function NFTDetailModal({ nft, onClose, wallet, onAction }) {
+  const [tab, setTab] = useState('details');
+  const [bidAmt, setBidAmt] = useState('');
+  const [listPrice, setListPrice] = useState('');
+  const [listToken, setListToken] = useState('CC');
+  const [state, setState] = useState('idle');
+  const [msg, setMsg] = useState('');
+  const isOwner = nft.owner === (wallet?.partyId || '');
 
-  useEffect(() => {
-    document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = ""; };
-  }, []);
-
-  const minBid = ((nft.highBid || nft.price || 0) * 1.02);
-
-  const handleBid = useCallback(async () => {
-    const v = parseFloat(bidAmt);
-    if (!bidAmt || isNaN(v) || v < minBid) return;
-    if (!wallet) { onOpenWallet?.(); return; }
-    setTxState("pending");
-    setTxMsg("Confirm in your wallet…");
+  const run = async (fn, label) => {
+    setState('pending'); setMsg(`${label}…`);
+    await new Promise(r => setTimeout(r, 1000));
     try {
-      const offerSats = BigInt(Math.round(v * 1e8));
-      if (!offerSats || offerSats <= 0) { setTxState("error"); setTxMsg("Enter a valid bid amount"); setTimeout(()=>setTxState("idle"),3000); return; }
-      await sendContractTx("offer", { tokenId: nft.id, offerSats }, wallet);
-      setBidPlaced(true);
-      setTxState("success");
-      setTxMsg("Bid placed on-chain ✓");
-      onToast?.(`Bid of ₿${parseFloat(bidAmt).toFixed(4)} placed on ${nft.name} ✓`, "success");
-      setTimeout(() => { setBidPlaced(false); setTxState("idle"); setBidAmt(""); }, 3000);
+      const r = fn();
+      setState('success'); setMsg(`${label} successful`);
+      setTimeout(() => { onAction(); onClose(); }, 1800);
+      return r;
     } catch (e) {
-      setTxState("error");
-      setTxMsg(e.message?.includes("rejected") ? "Rejected in wallet" : e.message || "Transaction failed");
-      setTimeout(() => setTxState("idle"), 4000);
+      setState('error'); setMsg(e.message);
+      setTimeout(() => setState('idle'), 3000);
     }
-  }, [bidAmt, minBid, wallet, nft]);
-
-  const handleBuy = useCallback(async () => {
-    if (!wallet) { onOpenWallet?.(); return; }
-
-    // PoYMarket buy flow — single on-chain transaction:
-    //   buyer calls buyNFT(tokenId) and sends priceSats as tx.value in the same tx.
-    //   The contract verifies tx.value == listingPrice, then transfers ownership
-    //   and pays seller (minus fee) via Blockchain.tx.transfer internally.
-    //   No manual BTC send required — everything happens atomically.
-
-    const priceSats = BigInt(Math.round(nft.price * 1e8));
-
-    setTxState("pending");
-    setTxMsg(`Confirm in wallet — buying ${nft.name} for ₿${nft.price.toFixed(4)}…`);
-
-    try {
-      const result = await sendContractTx(
-        "buy",
-        { tokenId: nft.id, priceSats },  // priceSats used as callValue in OP_WALLET path
-        wallet
-      );
-
-      if (result?.demo) {
-        setTxMsg(`Demo: ${nft.name} #${nft.num} purchased ✓ (testnet demo mode)`);
-      } else {
-        const shortTx = typeof result?.txHash === "string" ? result.txHash.slice(0, 12) + "…" : "confirmed";
-        setTxMsg(`✓ Purchase confirmed (${shortTx}) — NFT transferred to your wallet`);
-      }
-      setTxState("success");
-      onToast?.(`${nft.name} #${nft.num} purchased ✓`, "success");
-      setTimeout(() => setTxState("idle"), 6000);
-
-    } catch (e) {
-      const msg = e?.message ?? "";
-      if (msg.includes("rejected") || msg.includes("cancel") || msg.includes("denied") || msg.includes("User refused")) {
-        setTxState("error");
-        setTxMsg("Purchase cancelled");
-      } else if (msg.includes("wrong payment")) {
-        setTxState("error");
-        setTxMsg("Price mismatch — the listing price may have changed. Refresh and try again.");
-      } else if (msg.includes("not listed")) {
-        setTxState("error");
-        setTxMsg("This NFT is no longer listed for sale.");
-      } else {
-        setTxState("error");
-        setTxMsg(msg || "Purchase failed — check your wallet and try again");
-      }
-      setTimeout(() => setTxState("idle"), 5000);
-    }
-  }, [wallet, nft, onOpenWallet, onToast]);
-
-  const fakeBids = useMemo(() => [
-    { addr: "bc1q...aa1c", amount: nft.highBid || (nft.price * 0.95), time: "2m ago" },
-    { addr: "bc1q...bb2d", amount: ((nft.highBid || nft.price * 0.95) * 0.97), time: "18m ago" },
-    { addr: "bc1q...cc3e", amount: ((nft.highBid || nft.price * 0.95) * 0.93), time: "1h ago" },
-  ], [nft]);
+  };
 
   return (
-    <div
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, zIndex: 1500, background: "rgba(8,8,15,0.9)", backdropFilter: "blur(20px)", display: "flex", alignItems: isMobile ? "flex-end" : "center", justifyContent: "center", padding: isMobile ? 0 : 24, overflowY: "auto" }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: C.surface, border: `1px solid ${r.color}33`,
-          borderRadius: isMobile ? "20px 20px 0 0" : 28,
-          maxWidth: isMobile ? "100%" : 960, width: "100%",
-          maxHeight: isMobile ? "92vh" : "90vh",
-          display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", overflow: "hidden",
-          animation: "mIn 0.28s cubic-bezier(0.34,1.56,0.64,1)",
-          boxShadow: `0 40px 100px #00000099, 0 0 0 1px ${r.color}18`,
-        }}
-      >
-        {/* Left panel — hidden on mobile */}
-        {!isMobile && <div style={{ background: "#09090F", padding: 40, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, overflow: "auto" }}>
-          <div style={{ borderRadius: 20, overflow: "hidden", boxShadow: `0 0 60px ${r.glow}` }}>
-            <NFTCanvas nft={nft} size={280} />
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 1800, background: 'rgba(5,8,17,0.9)', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, overflowY: 'auto' }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, padding: 32, width: '100%', maxWidth: 660, display: 'flex', gap: 28, flexWrap: 'wrap' }}>
+        {/* Left: art */}
+        <div style={{ flexShrink: 0 }}>
+          <div style={{ borderRadius: 14, overflow: 'hidden', border: `1px solid ${nft.rarityColor}44` }}>
+            <NFTCanvas nft={nft} size={240} />
           </div>
-
-          <div style={{ width: "100%", background: C.card, borderRadius: 14, padding: "14px 16px" }}>
-            <div style={{ fontSize: 10, color: C.muted, marginBottom: 8, letterSpacing: "0.07em" }}>PRICE HISTORY</div>
-            <Sparkline data={priceHist} w={240} h={44} color={r.color} />
-            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
-              <Mono size={10} color={C.muted}>10 epochs</Mono>
-              <BtcPrice value={nft.lastSale} size={12} />
-            </div>
+          <div style={{ marginTop: 10, display: 'flex', gap: 6, justifyContent: 'center' }}>
+            <Tag color={nft.rarityColor}>{nft.rarity}</Tag>
+            <Tag color={C.primary}>EPOCH {nft.epoch}</Tag>
           </div>
+        </div>
+        {/* Right: info */}
+        <div style={{ flex: 1, minWidth: 220 }}>
+          <h2 style={{ fontFamily: FONT.display, fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 4 }}>{nft.name}</h2>
+          <Mono>#{nft.num} · {nft.tier} Tier</Mono>
+          <div style={{ height: 1, background: C.border, margin: '14px 0' }} />
 
-          <div style={{ display: "flex", gap: 24 }}>
-            {[["♥", nft.likes, C.danger], ["👁", nft.views.toLocaleString(), C.muted]].map(([icon, val, col]) => (
-              <div key={String(icon)} style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 18 }}>{icon}</div>
-                <Mono size={12} color={col}>{val}</Mono>
+          {/* Stats */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
+            {[
+              ['Staked CC', `${fmt(nft.stakedCC)}`],
+              ['APY', `${nft.apy}%`],
+              ['Accrued CBTC', fmtBtc(nft.accruedCBTC)],
+              ['Contract', shortId(nft.contractId)],
+            ].map(([k, v]) => (
+              <div key={k} style={{ background: C.faint, borderRadius: 8, padding: '8px 12px' }}>
+                <div style={{ fontSize: 9, color: C.muted, marginBottom: 2, letterSpacing: '0.08em' }}>{k}</div>
+                <Mono color={C.text} size={13}>{v}</Mono>
               </div>
             ))}
-          </div>
-        </div>}
-
-        {/* Right panel — full width on mobile */}
-        <div style={{ padding: "20px clamp(16px,4vw,32px) calc(20px + env(safe-area-inset-bottom))", overflow: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
-          {/* Mobile NFT preview */}
-          {isMobile && (
-            <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 4 }}>
-              <div style={{ borderRadius: 12, overflow: "hidden", flexShrink: 0 }}><NFTCanvas nft={nft} size={72} /></div>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 900, color: C.text }}>{nft.name} <span style={{ color: r.color }}>#{nft.num}</span></div>
-                <RarityBadge rarity={nft.rarity} tiny />
-              </div>
-              <button onClick={onClose} style={{ marginLeft: "auto", background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 32, height: 32, cursor: "pointer", color: C.muted, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>✕</button>
-            </div>
-          )}
-          {!isMobile && <button
-            onClick={onClose}
-            style={{ alignSelf: "flex-end", background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 30, height: 30, cursor: "pointer", color: C.muted, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}
-          >✕</button>}
-
-          {/* Creator row */}
-          {creator && (
-            <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.card, borderRadius: 12, padding: "8px 14px" }}>
-              <div style={{ width: 32, height: 32, borderRadius: "50%", background: `${creator.color}20`, border: `1.5px solid ${creator.color}44`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15 }}>{creator.avatar}</div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 10, color: C.muted }}>CREATOR</div>
-                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{creator.name}</span>
-                  {creator.verified && <span style={{ color: C.primary, fontSize: 11 }}>✓</span>}
-                </div>
-              </div>
-              <RarityBadge rarity={nft.rarity} tiny />
-            </div>
-          )}
-
-          <div>
-            <h2 style={{ fontSize: 24, fontWeight: 900, letterSpacing: "-0.03em", margin: "0 0 4px", color: C.text }}>
-              {nft.name} <span style={{ color: r.color }}>#{nft.num}</span>
-            </h2>
-            <Mono size={11} color={C.muted}>Token #{nft.id} · Epoch #{nft.epoch} · {nft.staked.toLocaleString()} PoY staked</Mono>
-          </div>
-
-          {/* Price block */}
-          <div style={{ background: `${r.color}0C`, border: `1px solid ${r.color}33`, borderRadius: 14, padding: "14px 18px" }}>
-            {nft.auction ? (
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                <div>
-                  <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>CURRENT BID</div>
-                  <div style={{ fontSize: 26, fontWeight: 900, fontFamily: "'JetBrains Mono', monospace", color: r.color }}>₿ {(nft.highBid || 0).toFixed(4)}</div>
-                </div>
-                <div style={{ textAlign: "right" }}>
-                  <div style={{ fontSize: 10, color: C.muted, marginBottom: 6 }}>ENDS IN</div>
-                  <CountdownInline endMs={nft.auctionEnd} />
-                  <div style={{ marginTop: 4 }}><Mono size={10} color={C.muted}>{nft.bids} bids</Mono></div>
-                </div>
-              </div>
-            ) : nft.listed ? (
-              <>
-                <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>LIST PRICE</div>
-                <div style={{ fontSize: 28, fontWeight: 900, fontFamily: "'JetBrains Mono', monospace", color: r.color }}>₿ {nft.price.toFixed(4)}</div>
-                <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>Last sale: ₿{nft.lastSale.toFixed(4)}</div>
-              </>
-            ) : (
-              <div style={{ fontSize: 13, color: C.muted }}>Not currently listed — make an offer to the owner</div>
-            )}
           </div>
 
           {/* Tabs */}
-          <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${C.border}`, paddingBottom: 10 }}>
-            {["details", "traits", "bids", "history"].map((t) => (
-              <button key={t} onClick={() => setMTab(t)} style={{
-                background: mTab === t ? `${r.color}18` : "none",
-                border: mTab === t ? `1px solid ${r.color}44` : "1px solid transparent",
-                borderRadius: 20, padding: "5px 13px",
-                color: mTab === t ? r.color : C.muted,
-                fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
-                textTransform: "capitalize",
-              }}>{t}</button>
+          <div style={{ display: 'flex', gap: 4, marginBottom: 14 }}>
+            {['details', isOwner ? 'manage' : 'buy'].map(t => (
+              <button key={t} onClick={() => setTab(t)}
+                style={{ background: tab === t ? C.primary : C.faint, border: 'none', borderRadius: 6, padding: '6px 14px', color: tab === t ? '#fff' : C.muted, fontSize: 12, cursor: 'pointer', fontFamily: FONT.body, fontWeight: 600, textTransform: 'capitalize' }}>
+                {t}
+              </button>
             ))}
           </div>
 
-          <div style={{ flex: 1 }}>
-            {mTab === "details" && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                {[["Staked", `${nft.staked.toLocaleString()} PoY`], ["Yield Earned", `₿ ${nft.yield}`], ["Owner", nft.owner], ["Epoch", `#${nft.epoch}`], ["Rarity", nft.rarity], ["Creator", nft.creator]].map(([k, v]) => (
-                  <div key={k} style={{ background: C.card, borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 9, color: C.muted, marginBottom: 3, letterSpacing: "0.07em" }}>{k}</div>
-                    <Mono size={12} color={C.text}>{v}</Mono>
+          {tab === 'details' && (
+            <div>
+              {nft.listed && (
+                <div style={{ background: C.faint, borderRadius: 10, padding: 12, marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>LISTING PRICE</div>
+                  <Mono color={nft.listingToken === 'CBTC' ? C.cbtc : C.secondary} size={18}>{fmt(nft.listingPrice)} {nft.listingToken}</Mono>
+                  {nft.highBid > 0 && <div style={{ marginTop: 6 }}><Mono color={C.muted}>Highest bid: </Mono><Mono color={C.primary}>{fmt(nft.highBid)} {nft.listingToken}</Mono></div>}
+                </div>
+              )}
+              <Mono color={C.muted} size={11}>Contract ID</Mono>
+              <Mono color={C.text} size={10} style={{ display: 'block', marginTop: 2, wordBreak: 'break-all' }}>{nft.contractId}</Mono>
+            </div>
+          )}
+
+          {tab === 'buy' && !isOwner && (
+            <div>
+              {nft.listed ? (
+                <>
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>PRICE</div>
+                    <Mono color={C.secondary} size={20}>{fmt(nft.listingPrice)} {nft.listingToken}</Mono>
                   </div>
+                  <Btn onClick={() => run(() => buyNFT(nft.id), `Buy ${nft.name}`)} variant="primary" style={{ width: '100%', marginBottom: 10 }} disabled={state === 'pending'}>
+                    Buy Now — {fmt(nft.listingPrice)} {nft.listingToken}
+                  </Btn>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                    <input value={bidAmt} onChange={e => setBidAmt(e.target.value)} type="number" placeholder="Bid amount"
+                      style={{ flex: 1, background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, padding: '8px 12px', color: C.text, fontSize: 13, fontFamily: FONT.mono, outline: 'none' }} />
+                    <Btn onClick={() => run(() => placeBid(nft.id, parseFloat(bidAmt), nft.listingToken), 'Bid')} variant="ghost" disabled={!bidAmt || state === 'pending'}>Bid</Btn>
+                  </div>
+                </>
+              ) : <Mono color={C.muted}>This NFT is not currently listed for sale.</Mono>}
+            </div>
+          )}
+
+          {tab === 'manage' && isOwner && (
+            <div>
+              {!nft.listed ? (
+                <>
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                    <input value={listPrice} onChange={e => setListPrice(e.target.value)} type="number" placeholder="Price"
+                      style={{ flex: 1, background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, padding: '8px 12px', color: C.text, fontSize: 13, fontFamily: FONT.mono, outline: 'none' }} />
+                    <select value={listToken} onChange={e => setListToken(e.target.value)}
+                      style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, padding: '8px 12px', color: C.text, fontSize: 13, outline: 'none' }}>
+                      <option>CC</option><option>CBTC</option>
+                    </select>
+                  </div>
+                  <Btn onClick={() => run(() => listNFT(nft.id, parseFloat(listPrice), listToken), 'List NFT')} variant="primary" style={{ width: '100%', marginBottom: 8 }} disabled={!listPrice || state === 'pending'}>List for Sale</Btn>
+                </>
+              ) : (
+                <Btn onClick={() => run(() => delistNFT(nft.id), 'Delist NFT')} variant="danger" style={{ width: '100%', marginBottom: 8 }} disabled={state === 'pending'}>Delist NFT</Btn>
+              )}
+              {nft.accruedCBTC > 0 && (
+                <Btn onClick={() => run(() => claimYield(nft.id), 'Claim yield')} variant="cbtc" style={{ width: '100%' }} disabled={state === 'pending'}>
+                  Claim {fmtBtc(nft.accruedCBTC)} CBTC
+                </Btn>
+              )}
+            </div>
+          )}
+
+          <StatusBar state={state} msg={msg} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── NFT Card ──────────────────────────────────────────────────────────────
+function NFTCard({ nft, onClick, size = 'md' }) {
+  const [hov, setHov] = useState(false);
+  const sz = size === 'sm' ? 140 : 200;
+  return (
+    <div
+      onClick={() => onClick(nft)}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        background: hov ? C.cardHov : C.card,
+        border: `1px solid ${hov ? nft.rarityColor + '66' : C.border}`,
+        borderRadius: 16, overflow: 'hidden', cursor: 'pointer',
+        transform: hov ? 'translateY(-3px)' : 'none',
+        boxShadow: hov ? `0 12px 40px ${nft.rarityColor}22` : 'none',
+        transition: 'all 0.18s',
+      }}
+    >
+      <div style={{ position: 'relative' }}>
+        <NFTCanvas nft={nft} size={sz} />
+        {nft.listed && (
+          <div style={{ position: 'absolute', top: 8, left: 8, background: C.success + 'DD', borderRadius: 4, padding: '2px 7px', fontSize: 9, fontWeight: 700, color: '#050811' }}>LISTED</div>
+        )}
+        <div style={{ position: 'absolute', top: 8, right: 8 }}>
+          <Tag color={nft.rarityColor}>{nft.rarity}</Tag>
+        </div>
+      </div>
+      <div style={{ padding: '12px 14px 14px' }}>
+        <div style={{ fontFamily: FONT.display, fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 4 }}>{nft.name}</div>
+        <Mono>#{nft.num} · {nft.tier}</Mono>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
+          <div>
+            <div style={{ fontSize: 9, color: C.muted, marginBottom: 1 }}>{nft.listed ? 'PRICE' : 'STAKED'}</div>
+            <Mono color={nft.listed ? C.secondary : C.primary} size={13}>
+              {nft.listed ? `${fmt(nft.listingPrice)} ${nft.listingToken}` : `${fmt(nft.stakedCC)} CC`}
+            </Mono>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: 9, color: C.muted, marginBottom: 1 }}>YIELD</div>
+            <Mono color={C.cbtc} size={12}>₿ {fmtBtc(nft.accruedCBTC)}</Mono>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Stats Bar ─────────────────────────────────────────────────────────────
+function StatsBar() {
+  const [tick, setTick] = useState(0);
+  useEffect(() => { const t = setInterval(() => setTick(x => x+1), 3000); return () => clearInterval(t); }, []);
+  const stats = [
+    { label: 'CC STAKED', value: fmt(ledger.totalCCStaked + tick * 17) },
+    { label: 'CBTC DISTRIBUTED', value: fmtBtc(ledger.totalCBTCDistributed + tick * 0.000003) },
+    { label: 'NFTs MINTED', value: String(ledger.totalNFTsMinted + Math.floor(tick / 4)) },
+    { label: 'CURRENT EPOCH', value: `#${ledger.currentEpoch}` },
+    { label: 'NEXT EPOCH', value: `${ledger.nextEpochHours - Math.floor(tick/12)}h` },
+  ];
+  return (
+    <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '10px 0', overflowX: 'auto' }}>
+      <div style={{ display: 'flex', gap: 0, minWidth: 600, maxWidth: 1200, margin: '0 auto', padding: '0 24px' }}>
+        {stats.map((s, i) => (
+          <div key={s.label} style={{ flex: 1, textAlign: 'center', borderRight: i < stats.length - 1 ? `1px solid ${C.border}` : 'none', padding: '0 16px' }}>
+            <div style={{ fontSize: 9, color: C.muted, letterSpacing: '0.1em', marginBottom: 2 }}>{s.label}</div>
+            <Mono color={C.text} size={13}>{s.value}</Mono>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────
+export default function App() {
+  const [wallet, setWallet] = useState(null);
+  const [tab, setTab] = useState('market');
+  const [walletModal, setWalletModal] = useState(false);
+  const [stakeModal, setStakeModal] = useState(false);
+  const [detailNFT, setDetailNFT] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [refresh, setRefresh] = useState(0);
+  const [filter, setFilter] = useState('all'); // all | cc | cbtc
+  const [search, setSearch] = useState('');
+
+  // Yield accrual ticker
+  useEffect(() => {
+    const t = setInterval(() => { accrueYield(); setRefresh(x => x+1); }, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Auto-reconnect on reload
+  useEffect(() => {
+    initLoop(
+      (provider) => { connectWallet(provider); setWallet({ provider, partyId: provider.party_id, email: provider.email }); },
+      () => {}
+    );
+    loop.autoConnect().catch(() => {});
+  }, []);
+
+  const showToast = (msg, type = 'success') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3500);
+  };
+
+  const handleDisconnect = async () => {
+    await loop.logout();
+    disconnectWallet();
+    setWallet(null);
+    showToast('Wallet disconnected', 'info');
+  };
+
+  const handleConnected = (info) => {
+    setWallet(info);
+    showToast(`Connected: ${info.partyId?.slice(0, 20)}…`, 'success');
+  };
+
+  // Filtered market NFTs
+  const marketNFTs = useMemo(() => {
+    let list = ledger.marketNFTs.filter(n => n.listed);
+    if (filter === 'cc') list = list.filter(n => n.listingToken === 'CC');
+    if (filter === 'cbtc') list = list.filter(n => n.listingToken === 'CBTC');
+    if (search) list = list.filter(n => n.name.toLowerCase().includes(search.toLowerCase()) || n.tier.toLowerCase().includes(search.toLowerCase()));
+    return list;
+  }, [refresh, filter, search]);
+
+  const NAV = [
+    { id: 'market', label: 'Marketplace' },
+    { id: 'stake', label: 'Stake' },
+    { id: 'my-nfts', label: 'My NFTs' },
+    { id: 'activity', label: 'Activity' },
+  ];
+
+  return (
+    <>
+      <style>{`
+        ${FONTS}
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: ${C.bg}; color: ${C.text}; font-family: ${FONT.body}; -webkit-font-smoothing: antialiased; }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 4px; }
+        input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+        input::placeholder { color: ${C.muted}; }
+        select { cursor: pointer; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        @keyframes slideIn { from{transform:translateY(20px);opacity:0} to{transform:none;opacity:1} }
+        @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+      `}</style>
+
+      {/* Header */}
+      <header style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, position: 'sticky', top: 0, zIndex: 100 }}>
+        <div style={{ maxWidth: 1200, margin: '0 auto', padding: '0 24px', height: 60, display: 'flex', alignItems: 'center', gap: 24 }}>
+          {/* Logo */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            <div style={{ width: 32, height: 32, background: `linear-gradient(135deg, ${C.primary}, ${C.secondary})`, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}>◈</div>
+            <span style={{ fontFamily: FONT.display, fontWeight: 800, fontSize: 17, color: C.text }}>PoY <span style={{ color: C.primary }}>Market</span></span>
+            <Tag color={C.secondary}>CANTON</Tag>
+          </div>
+
+          {/* Nav */}
+          <nav style={{ display: 'flex', gap: 2, flex: 1, marginLeft: 16 }}>
+            {NAV.map(n => (
+              <button key={n.id} onClick={() => setTab(n.id)}
+                style={{ background: tab === n.id ? C.faint : 'transparent', border: 'none', borderRadius: 7, padding: '6px 14px', color: tab === n.id ? C.text : C.muted, fontSize: 13, cursor: 'pointer', fontFamily: FONT.body, fontWeight: 600, transition: 'all 0.15s' }}>
+                {n.label}
+              </button>
+            ))}
+          </nav>
+
+          {/* Wallet */}
+          {wallet ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ background: C.faint, border: `1px solid ${C.border}`, borderRadius: 8, padding: '6px 12px', display: 'flex', gap: 14 }}>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: 9, color: C.muted }}>CC</div>
+                  <Mono color={C.secondary} size={12}>{fmt(ledger.ccBalance)}</Mono>
+                </div>
+                <div style={{ width: 1, background: C.border }} />
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: 9, color: C.muted }}>CBTC</div>
+                  <Mono color={C.cbtc} size={12}>{fmtBtc(ledger.cbtcBalance)}</Mono>
+                </div>
+              </div>
+              <div style={{ background: C.faint, border: `1px solid ${C.border}`, borderRadius: 8, padding: '6px 12px' }}>
+                <div style={{ fontSize: 9, color: C.muted }}>PARTY</div>
+                <Mono size={11}>{shortId(wallet.partyId || 'demo')}</Mono>
+              </div>
+              <Btn onClick={handleDisconnect} variant="ghost" size="sm">Disconnect</Btn>
+            </div>
+          ) : (
+            <Btn onClick={() => setWalletModal(true)} variant="primary">Connect Loop</Btn>
+          )}
+        </div>
+      </header>
+
+      {/* Stats ticker */}
+      <StatsBar />
+
+      {/* Main content */}
+      <main style={{ maxWidth: 1200, margin: '0 auto', padding: '28px 24px', animation: 'fadeIn 0.3s ease' }}>
+
+        {/* ── MARKETPLACE TAB ── */}
+        {tab === 'market' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
+              <div>
+                <h1 style={{ fontFamily: FONT.display, fontSize: 28, fontWeight: 800, color: C.text }}>
+                  Yield NFT <span style={{ color: C.primary }}>Marketplace</span>
+                </h1>
+                <p style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>{marketNFTs.length} NFTs listed · Buy with CC or CBTC</p>
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search NFTs…"
+                  style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 14px', color: C.text, fontSize: 13, fontFamily: FONT.body, outline: 'none', width: 180 }} />
+                {['all', 'cc', 'cbtc'].map(f => (
+                  <button key={f} onClick={() => setFilter(f)}
+                    style={{ background: filter === f ? C.primary : C.card, border: `1px solid ${filter === f ? C.primary : C.border}`, borderRadius: 8, padding: '8px 14px', color: filter === f ? '#fff' : C.muted, fontSize: 12, cursor: 'pointer', fontFamily: FONT.body, fontWeight: 600, textTransform: 'uppercase' }}>
+                    {f === 'all' ? 'All' : f === 'cc' ? '◈ CC' : '₿ CBTC'}
+                  </button>
                 ))}
+              </div>
+            </div>
+
+            {marketNFTs.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '80px 0', color: C.muted }}>
+                <div style={{ fontSize: 48, marginBottom: 16 }}>◈</div>
+                <div>No NFTs found matching your filters.</div>
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 18 }}>
+                {marketNFTs.map(nft => <NFTCard key={nft.id} nft={nft} onClick={setDetailNFT} />)}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── STAKE TAB ── */}
+        {tab === 'stake' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 28 }}>
+              <div>
+                <h1 style={{ fontFamily: FONT.display, fontSize: 28, fontWeight: 800, color: C.text }}>
+                  Stake <span style={{ color: C.secondary }}>CC</span> → Earn <span style={{ color: C.cbtc }}>CBTC</span>
+                </h1>
+                <p style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>Stake Canton Coin to earn simulated CBTC yield rewards and mint Yield NFTs.</p>
+              </div>
+              {wallet && <Btn onClick={() => setStakeModal(true)} variant="primary" size="lg">+ New Stake</Btn>}
+            </div>
+
+            {/* Tier cards */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 16, marginBottom: 32 }}>
+              {STAKING_CONFIG.tiers.map(tier => (
+                <Card key={tier.label} glow style={{ padding: 22 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 14 }}>
+                    <div>
+                      <div style={{ fontFamily: FONT.display, fontWeight: 800, fontSize: 18, color: C.text }}>{tier.label}</div>
+                      <Tag color={tier.rarityColor} style={{ marginTop: 4 }}>{tier.rarityLabel}</Tag>
+                    </div>
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 9, color: C.muted }}>CBTC APY</div>
+                      <Mono color={C.cbtc} size={20}>{tier.cbTcAPY}%</Mono>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 12, color: C.muted }}>
+                    Min: <Mono color={C.text}>{fmt(tier.minCC)} CC</Mono>
+                    {tier.maxCC < Infinity && <> · Max: <Mono color={C.text}>{fmt(tier.maxCC)} CC</Mono></>}
+                  </div>
+                  {wallet && (
+                    <Btn onClick={() => setStakeModal(true)} variant="ghost" size="sm" style={{ marginTop: 12, width: '100%' }}>
+                      Stake Now
+                    </Btn>
+                  )}
+                </Card>
+              ))}
+            </div>
+
+            {/* Active stakes */}
+            {wallet && ledger.stakes.length > 0 && (
+              <div>
+                <h2 style={{ fontFamily: FONT.display, fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 14 }}>Your Stakes</h2>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {ledger.stakes.map(stake => {
+                    const [mintState, setMintState] = useState('idle');
+                    const [mintMsg, setMintMsg] = useState('');
+                    return (
+                      <Card key={stake.id} style={{ padding: 18 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+                          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                            <div><div style={{ fontSize: 9, color: C.muted }}>STAKE ID</div><Mono>{stake.id}</Mono></div>
+                            <div><div style={{ fontSize: 9, color: C.muted }}>AMOUNT</div><Mono color={C.secondary}>{fmt(stake.ccAmount)} CC</Mono></div>
+                            <div><div style={{ fontSize: 9, color: C.muted }}>TIER</div><Mono color={C.text}>{stake.tier}</Mono></div>
+                            <div><div style={{ fontSize: 9, color: C.muted }}>APY</div><Mono color={C.cbtc}>{stake.apy}%</Mono></div>
+                            <div><div style={{ fontSize: 9, color: C.muted }}>ACCRUED CBTC</div><Mono color={C.cbtc}>₿ {fmtBtc(stake.accruedCBTC)}</Mono></div>
+                          </div>
+                          {!stake.nftId ? (
+                            <Btn size="sm" variant="primary" disabled={mintState === 'pending'}
+                              onClick={async () => {
+                                setMintState('pending'); setMintMsg('Minting…');
+                                await new Promise(r => setTimeout(r, 1200));
+                                try {
+                                  mintYieldNFT(stake.id);
+                                  setMintState('success'); setMintMsg('NFT minted!');
+                                  setRefresh(x => x+1);
+                                  setTimeout(() => { setMintState('idle'); setMintMsg(''); }, 3000);
+                                } catch (e) {
+                                  setMintState('error'); setMintMsg(e.message);
+                                  setTimeout(() => setMintState('idle'), 3000);
+                                }
+                              }}>
+                              {mintState === 'pending' ? 'Minting…' : '⬡ Mint Yield NFT'}
+                            </Btn>
+                          ) : <Tag color={C.success}>NFT MINTED ✓</Tag>}
+                        </div>
+                        <StatusBar state={mintState} msg={mintMsg} />
+                      </Card>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
-            {mTab === "traits" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {nft.traits.map((tr) => {
-                  const pct = tr.k === "Score" ? parseFloat(tr.v) : 65;
+            {!wallet && (
+              <div style={{ textAlign: 'center', padding: '60px 0', color: C.muted }}>
+                <div style={{ fontSize: 48, marginBottom: 14 }}>⟳</div>
+                <h3 style={{ fontFamily: FONT.display, fontSize: 18, color: C.text, marginBottom: 8 }}>Connect your Loop wallet to start staking</h3>
+                <Btn onClick={() => setWalletModal(true)} variant="primary" size="lg" style={{ marginTop: 8 }}>Connect Loop</Btn>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── MY NFTS TAB ── */}
+        {tab === 'my-nfts' && (
+          <div>
+            <h1 style={{ fontFamily: FONT.display, fontSize: 28, fontWeight: 800, color: C.text, marginBottom: 8 }}>
+              My <span style={{ color: C.primary }}>NFTs</span>
+            </h1>
+            {!wallet ? (
+              <div style={{ textAlign: 'center', padding: '80px 0', color: C.muted }}>
+                <div style={{ fontSize: 48, marginBottom: 14 }}>🔐</div>
+                <Btn onClick={() => setWalletModal(true)} variant="primary" size="lg">Connect Wallet</Btn>
+              </div>
+            ) : ledger.myNFTs.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '80px 0', color: C.muted }}>
+                <div style={{ fontSize: 48, marginBottom: 14 }}>◈</div>
+                <p>No NFTs yet. Stake CC and mint your first Yield NFT.</p>
+                <Btn onClick={() => setTab('stake')} variant="primary" size="lg" style={{ marginTop: 16 }}>Go to Stake</Btn>
+              </div>
+            ) : (
+              <>
+                <p style={{ color: C.muted, fontSize: 13, marginBottom: 20 }}>{ledger.myNFTs.length} NFTs owned</p>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 18 }}>
+                  {ledger.myNFTs.map(nft => <NFTCard key={nft.id} nft={nft} onClick={setDetailNFT} />)}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── ACTIVITY TAB ── */}
+        {tab === 'activity' && (
+          <div>
+            <h1 style={{ fontFamily: FONT.display, fontSize: 28, fontWeight: 800, color: C.text, marginBottom: 20 }}>
+              Activity <span style={{ color: C.primary }}>Log</span>
+            </h1>
+            {ledger.activity.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '80px 0', color: C.muted }}>No activity yet. Connect wallet and start staking.</div>
+            ) : (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16, overflow: 'hidden' }}>
+                {ledger.activity.map((a, i) => {
+                  const typeColor = { Staked: C.primary, Minted: C.secondary, Claimed: C.cbtc, Listed: C.success, Delisted: C.muted, Bought: C.success, Bid: C.primary }[a.type] || C.muted;
                   return (
-                    <div key={tr.k} style={{ background: C.card, borderRadius: 12, padding: "11px 13px" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: tr.k === "Score" ? 8 : 0 }}>
-                        <span style={{ fontSize: 11, color: C.muted }}>{tr.k}</span>
-                        <span style={{ fontSize: 12, fontWeight: 700, color: r.color }}>{tr.v}</span>
-                      </div>
-                      {tr.k === "Score" && (
-                        <div style={{ height: 4, background: C.surface, borderRadius: 2, overflow: "hidden" }}>
-                          <div style={{ width: `${pct}%`, height: "100%", background: `linear-gradient(90deg, ${C.primary}, ${r.color})`, borderRadius: 2 }} />
-                        </div>
-                      )}
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 20px', borderBottom: i < ledger.activity.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+                      <Tag color={typeColor}>{a.type.toUpperCase()}</Tag>
+                      <div style={{ flex: 1, fontSize: 13, color: C.text }}>{a.message}</div>
+                      <Mono color={C.muted}>{shortId(a.txId)}</Mono>
+                      <Mono color={C.muted}>{ago(a.time)}</Mono>
                     </div>
                   );
                 })}
               </div>
             )}
-
-            {mTab === "bids" && (
-              <div>
-                {nft.auction && (
-                  <div style={{ marginBottom: 14 }}>
-                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>
-                      PLACE BID (min ₿{minBid.toFixed(4)})
-                    </div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <input
-                        type="number" min={minBid} step="0.0001"
-                        value={bidAmt} onChange={(e) => setBidAmt(e.target.value)}
-                        placeholder={`≥ ${minBid.toFixed(4)}`}
-                        style={{ flex: 1, background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 13px", color: C.text, fontSize: 13, fontFamily: "'JetBrains Mono', monospace", outline: "none" }}
-                      />
-                      <button
-                        onClick={handleBid}
-                        disabled={bidPlaced}
-                        style={{
-                          background: bidPlaced ? C.success : `linear-gradient(90deg, ${C.primary}, ${C.secondary})`,
-                          border: "none", borderRadius: 10, padding: "10px 18px",
-                          color: "#fff", fontWeight: 800, fontSize: 13, cursor: "pointer", fontFamily: "inherit",
-                          transition: "background 0.3s",
-                        }}
-                      >{bidPlaced ? "✓ Bid!" : wallet ? "Bid" : "Connect Wallet"}</button>
-                    </div>
-                  </div>
-                )}
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {fakeBids.map((b, i) => (
-                    <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.card, borderRadius: 10, padding: "10px 13px" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        {i === 0 && <Mono size={9} color={C.success} weight={700}>TOP</Mono>}
-                        <Mono size={11} color={C.muted}>{b.addr}</Mono>
-                      </div>
-                      <div style={{ textAlign: "right" }}>
-                        <BtcPrice value={b.amount} size={13} />
-                        <div style={{ fontSize: 9, color: C.muted }}>{b.time}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {mTab === "history" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {[
-                  { type: "Sale",     from: "bc1q...f8a2", price: nft.lastSale,   time: "2d ago"  },
-                  { type: "List",     from: "bc1q...qr9x", price: nft.price,      time: "3d ago"  },
-                  { type: "Transfer", from: "bc1q...ab1c", price: null,           time: "5d ago"  },
-                  { type: "Mint",     from: "Protocol",    price: null,           time: "7d ago"  },
-                ].map((a, i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.card, borderRadius: 10, padding: "10px 13px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{
-                        background: a.type === "Sale" ? `${C.success}18` : `${C.muted}18`,
-                        color: a.type === "Sale" ? C.success : C.muted,
-                        border: `1px solid ${a.type === "Sale" ? C.success : C.muted}33`,
-                        borderRadius: 5, padding: "2px 7px", fontSize: 9, fontWeight: 700,
-                        fontFamily: "'JetBrains Mono', monospace",
-                      }}>{a.type.toUpperCase()}</span>
-                      <Mono size={11} color={C.muted}>{a.from}</Mono>
-                    </div>
-                    <div style={{ textAlign: "right" }}>
-                      {a.price != null && <BtcPrice value={a.price} size={12} />}
-                      <div style={{ fontSize: 9, color: C.muted }}>{a.time}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* TX status banner */}
-          {txState !== "idle" && (
-            <div style={{
-              borderRadius: 12, padding: "11px 16px",
-              background: txState === "error" ? `${C.danger}18` : txState === "success" ? `${C.success}18` : `${C.primary}18`,
-              border: `1px solid ${txState === "error" ? C.danger : txState === "success" ? C.success : C.primary}44`,
-              display: "flex", alignItems: "center", gap: 10,
-            }}>
-              {txState === "pending" && (
-                <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${C.primary}44`, borderTopColor: C.primary, animation: "spin 0.7s linear infinite", flexShrink: 0 }} />
-              )}
-              <span style={{ fontSize: 12, color: txState === "error" ? C.danger : txState === "success" ? C.success : C.primary, fontWeight: 600 }}>
-                {txMsg}
-              </span>
-            </div>
-          )}
-
-          {/* CTA buttons */}
-          <div style={{ display: "flex", gap: 10, paddingTop: 4 }}>
-            {nft.listed && (
-              <button
-                onClick={nft.auction ? handleBid : handleBuy}
-                disabled={txState === "pending"}
-                style={{
-                  flex: 1,
-                  background: txState === "pending"
-                    ? C.dim
-                    : txState === "success"
-                    ? C.success
-                    : `linear-gradient(90deg, ${C.primary}, ${C.secondary})`,
-                  border: "none", borderRadius: 30, padding: "13px 0",
-                  color: "#fff", fontWeight: 800, fontSize: 15,
-                  cursor: txState === "pending" ? "not-allowed" : "pointer",
-                  fontFamily: "inherit",
-                  boxShadow: txState === "pending" ? "none" : `0 6px 24px ${C.primary}44`,
-                  transition: "background 0.3s",
-                }}
-              >
-                {txState === "pending"
-                  ? "⏳ Processing…"
-                  : txState === "success"
-                  ? "✓ Done"
-                  : !wallet
-                  ? "🔌 Connect Wallet to Buy"
-                  : nft.auction
-                  ? `Place Bid · ₿${nft.price.toFixed(4)}`
-                  : `Buy Now · ₿${nft.price.toFixed(4)}`}
-              </button>
-            )}
-            {!nft.listed && (
-              <button
-                onClick={() => { setTxMsg("Make an offer: enter amount in the Bids tab"); setTxState("success"); setMTab("bids"); setTimeout(() => setTxState("idle"), 3000); }}
-                style={{
-                  flex: 1, background: `${C.secondary}18`,
-                  border: `1px solid ${C.secondary}44`,
-                  borderRadius: 30, padding: "13px 0",
-                  color: C.secondary, fontWeight: 700, fontSize: 14,
-                  cursor: "pointer", fontFamily: "inherit",
-                }}
-              >
-                💬 Make Offer
-              </button>
-            )}
-            {nft.listed && !wallet && (
-              <div style={{ width: "100%", marginTop: 6, background: `${C.primary}08`, border: `1px dashed ${C.primary}30`, borderRadius: 12, padding: "9px 14px", display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between" }}>
-                <span style={{ fontSize: 11, color: C.muted }}>🚰 Need tBTC for testnet?</span>
-                <a href="https://faucet.opnet.org/" target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, fontWeight: 700, color: C.primary, textDecoration: "none" }}>Get free tBTC →</a>
-              </div>
-            )}
-            <button
-              onClick={() => setWishlisted((w) => !w)}
-              style={{
-                flex: nft.listed ? 0 : 0,
-                background: wishlisted ? `${C.danger}18` : "transparent",
-                border: `1px solid ${wishlisted ? C.danger + "66" : C.borderMid}`,
-                borderRadius: 30, padding: "13px 18px",
-                color: wishlisted ? C.danger : C.text, fontWeight: 600, fontSize: 14,
-                cursor: "pointer", fontFamily: "inherit",
-              }}
-            >
-              {wishlisted ? "♥" : "♡"}
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Live Ticker ─────────────────────────────────────────────────────────── */
-function LiveTicker() {
-  const ITEMS = [...TICKER_ITEMS, ...TICKER_ITEMS, ...TICKER_ITEMS];
-  const [offset, setOffset] = useState(0);
-  const ITEM_W = 220;
-  const totalW = TICKER_ITEMS.length * ITEM_W;
-
-  useEffect(() => {
-    let raf;
-    const step = () => {
-      setOffset((prev) => (prev + 0.45) % totalW);
-      raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
-  }, [totalW]);
-
-  return (
-    <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, height: 34, overflow: "hidden", position: "relative" }}>
-      <div style={{ position: "absolute", left: 0, top: 0, height: "100%", display: "flex", alignItems: "center", gap: 0, transform: `translateX(-${offset}px)`, whiteSpace: "nowrap" }}>
-        {ITEMS.map((item, i) => (
-          <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 8, width: ITEM_W, flexShrink: 0 }}>
-            <span style={{
-              background: item.color + "22", color: item.color,
-              border: `1px solid ${item.color}33`, borderRadius: 4,
-              padding: "1px 6px", fontSize: 9, fontWeight: 800,
-              fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.08em",
-            }}>{item.type}</span>
-            <span style={{ fontSize: 11, color: C.text }}>{item.nft}</span>
-            {item.price !== "—" && (
-              <span style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace", color: item.type === "SALE" ? C.success : C.primary }}>₿{item.price}</span>
-            )}
-            <span style={{ color: C.dim, marginLeft: 8 }}>·</span>
-          </span>
-        ))}
-      </div>
-      <div style={{ position: "absolute", left: 0, top: 0, width: 80, height: "100%", background: `linear-gradient(to right, ${C.surface}, transparent)`, pointerEvents: "none", zIndex: 2 }} />
-      <div style={{ position: "absolute", right: 0, top: 0, width: 80, height: "100%", background: `linear-gradient(to left, ${C.surface}, transparent)`, pointerEvents: "none", zIndex: 2 }} />
-    </div>
-  );
-}
-
-/* ── Notification Bell ───────────────────────────────────────────────────── */
-function NotifBell() {
-  const [open, setOpen] = useState(false);
-  const [read, setRead] = useState(false);
-  const ref = useRef(null);
-
-  const notifs = [
-    { icon: "💰", text: "Your offer on Block Sovereign was accepted",  time: "2m ago",  new: true  },
-    { icon: "⬆",  text: "Void Miner floor price up 14%",              time: "18m ago", new: true  },
-    { icon: "⏱",  text: "Satoshi Proof auction ends in 24h",          time: "1h ago",  new: true  },
-    { icon: "🎉",  text: "Citrus Yield received a new offer",          time: "3h ago",  new: true  },
-    { icon: "✓",   text: "Hash Pilgrim purchase confirmed on-chain",   time: "6h ago",  new: false },
-  ];
-
-  useEffect(() => {
-    const handleClick = (e) => {
-      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, []);
-
-  return (
-    <div ref={ref} style={{ position: "relative" }}>
-      <button
-        onClick={() => { setOpen((o) => !o); setRead(true); }}
-        style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 38, height: 38, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, position: "relative", transition: "border-color 0.2s" }}
-        onMouseEnter={(e) => { e.currentTarget.style.borderColor = C.primary + "55"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.borderColor = C.border; }}
-      >
-        🔔
-        {!read && <div style={{ position: "absolute", top: -2, right: -2, width: 16, height: 16, borderRadius: "50%", background: C.danger, border: `2px solid ${C.bg}`, fontSize: 9, fontWeight: 800, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}>4</div>}
-      </button>
-
-      {open && (
-        <div style={{ position: "absolute", top: 46, right: 0, background: C.surface, border: `1px solid ${C.borderMid}`, borderRadius: 18, width: 320, boxShadow: "0 24px 56px #00000099", zIndex: 600, overflow: "hidden", animation: "mIn 0.2s ease" }}>
-          <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ fontWeight: 700, fontSize: 14, color: C.text }}>Notifications</span>
-            <button onClick={() => setOpen(false)} style={{ background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 13 }}>✕</button>
-          </div>
-          {notifs.map((n, i) => (
-            <div key={i} style={{ padding: "12px 18px", display: "flex", gap: 12, alignItems: "flex-start", background: n.new && !read ? `${C.primary}06` : "transparent", borderBottom: `1px solid ${C.border}`, cursor: "pointer", transition: "background 0.15s" }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "#FFFFFF05"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = n.new && !read ? `${C.primary}06` : "transparent"; }}
-            >
-              <span style={{ fontSize: 17, flexShrink: 0 }}>{n.icon}</span>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: C.text, lineHeight: 1.5 }}>{n.text}</div>
-                <Mono size={10} color={C.muted}>{n.time}</Mono>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── Top Nav ─────────────────────────────────────────────────────────────── */
-function Nav({ tab, setTab, wallet, onOpenWallet, onDisconnect }) {
-  const [searchFocused, setSearchFocused] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const { isMobile, isTablet } = useBreakpoint();
-  const TABS = [["marketplace", "🛒 Market"], ["my-nfts", "💼 My NFTs"], ["activity", "📋 Activity"], ["analytics", "📈 Analytics"], ["faucet", "🚰 Faucet"]];
-  const TABS_DESKTOP = [["marketplace", "Marketplace"], ["my-nfts", "My NFTs"], ["activity", "Activity"], ["analytics", "Analytics"], ["faucet", "🚰 Faucet"]];
-
-  return (
-    <>
-      <nav style={{ position: "sticky", top: 0, zIndex: 300, background: "rgba(8,8,15,0.96)", backdropFilter: "blur(28px)", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", padding: isMobile ? "0 16px" : "0 28px", height: 60, gap: 0 }}>
-        {/* Logo */}
-        <div style={{ display: "flex", alignItems: "center", gap: 9, marginRight: isMobile ? "auto" : 28, flexShrink: 0 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 9, background: `linear-gradient(135deg, ${C.primary}, ${C.secondary})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, boxShadow: `0 4px 18px ${C.primary}44` }}>⚡</div>
-          <div>
-            <div style={{ fontSize: 14, fontWeight: 900, letterSpacing: "-0.03em", color: C.text, lineHeight: 1 }}>PoY<span style={{ color: C.primary }}>Market</span></div>
-            {!isMobile && <div style={{ fontSize: 8, color: C.muted, letterSpacing: "0.2em", textTransform: "uppercase" }}>Bitcoin NFTs</div>}
-          </div>
-        </div>
-
-        {/* Search — hidden on mobile */}
-        {!isMobile && (
-          <div style={{ position: "relative", width: isTablet ? 180 : 280, marginRight: 16, flexShrink: 0 }}>
-            <input
-              placeholder="Search NFTs, creators…"
-              onFocus={() => setSearchFocused(true)}
-              onBlur={() => setSearchFocused(false)}
-              style={{ width: "100%", boxSizing: "border-box", background: searchFocused ? C.card : C.surface, border: `1px solid ${searchFocused ? C.primary + "66" : C.border}`, borderRadius: 30, padding: "8px 16px 8px 34px", color: C.text, fontSize: 13, fontFamily: "inherit", outline: "none", transition: "all 0.2s" }}
-            />
-            <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 14, pointerEvents: "none" }}>⌕</span>
           </div>
         )}
-
-        {/* Desktop tabs */}
-        {!isMobile && (
-          <div style={{ display: "flex", flex: 1 }}>
-            {TABS_DESKTOP.map(([id, label]) => (
-              <button key={id} onClick={() => setTab(id)} style={{ background: "none", border: "none", borderBottom: tab === id ? `2px solid ${C.primary}` : "2px solid transparent", padding: "0 14px", height: 60, color: tab === id ? C.primary : C.muted, fontWeight: tab === id ? 700 : 400, fontSize: 13, cursor: "pointer", fontFamily: "inherit", transition: "color 0.18s", whiteSpace: "nowrap" }}>
-                {label}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* Right */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {!isMobile && <NotifBell />}
-          {wallet ? (
-            <div style={{ display: "flex", alignItems: "center", gap: 7, background: C.card, border: `1px solid ${C.primary}44`, borderRadius: 30, padding: isMobile ? "6px 10px" : "6px 14px", cursor: "pointer" }}
-              onClick={onDisconnect} title="Click to disconnect"
-            >
-              <span style={{ fontSize: 14 }}>{wallet.walletIcon}</span>
-              <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.success, boxShadow: `0 0 6px ${C.success}` }} />
-              {!isMobile && <Mono size={12} color={C.text}>{wallet.address.slice(0, 6)}…{wallet.address.slice(-4)}</Mono>}
-            </div>
-          ) : (
-            <button onClick={onOpenWallet} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: isMobile ? "8px 14px" : "9px 20px", color: "#fff", fontWeight: 700, fontSize: isMobile ? 12 : 13, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
-              {isMobile ? "Connect" : "Connect Wallet"}
-            </button>
-          )}
-          {/* Hamburger */}
-          {isMobile && (
-            <button onClick={() => setMenuOpen(o => !o)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 9, width: 38, height: 38, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 5, flexShrink: 0 }}>
-              <div style={{ width: 18, height: 2, background: menuOpen ? C.primary : C.muted, borderRadius: 2, transform: menuOpen ? "rotate(45deg) translate(5px,5px)" : "none", transition: "all 0.2s" }} />
-              <div style={{ width: 18, height: 2, background: menuOpen ? C.primary : C.muted, borderRadius: 2, opacity: menuOpen ? 0 : 1, transition: "all 0.2s" }} />
-              <div style={{ width: 18, height: 2, background: menuOpen ? C.primary : C.muted, borderRadius: 2, transform: menuOpen ? "rotate(-45deg) translate(5px,-5px)" : "none", transition: "all 0.2s" }} />
-            </button>
-          )}
-        </div>
-      </nav>
-
-      {/* Mobile slide-down menu */}
-      {isMobile && menuOpen && (
-        <div style={{ position: "sticky", top: 60, zIndex: 299, background: "rgba(8,8,15,0.98)", backdropFilter: "blur(28px)", borderBottom: `1px solid ${C.border}`, padding: "8px 16px 16px", animation: "mIn 0.2s ease" }}>
-          {/* Mobile search */}
-          <div style={{ position: "relative", marginBottom: 12 }}>
-            <input placeholder="Search NFTs, creators…" style={{ width: "100%", boxSizing: "border-box", background: C.card, border: `1px solid ${C.border}`, borderRadius: 30, padding: "10px 16px 10px 36px", color: C.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
-            <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 15, pointerEvents: "none" }}>⌕</span>
-          </div>
-          {/* Tab buttons */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            {TABS.map(([id, label]) => (
-              <button key={id} onClick={() => { setTab(id); setMenuOpen(false); }} style={{ background: tab === id ? `${C.primary}18` : C.card, border: `1px solid ${tab === id ? C.primary + "55" : C.border}`, borderRadius: 12, padding: "12px 8px", color: tab === id ? C.primary : C.muted, fontWeight: tab === id ? 700 : 500, fontSize: 13, cursor: "pointer", fontFamily: "inherit", textAlign: "center" }}>
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Mobile bottom tab bar */}
-      {isMobile && (
-        <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 400, background: "rgba(8,8,15,0.97)", backdropFilter: "blur(28px)", borderTop: `1px solid ${C.border}`, display: "flex", padding: "8px 0 calc(8px + env(safe-area-inset-bottom))" }}>
-          {[["marketplace","🛒","Market"],["my-nfts","💼","NFTs"],["activity","📋","Activity"],["analytics","📈","Stats"],["faucet","🚰","Faucet"]].map(([id,icon,label]) => (
-            <button key={id} onClick={() => { setTab(id); setMenuOpen(false); }} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "4px 0" }}>
-              <span style={{ fontSize: 20 }}>{icon}</span>
-              <span style={{ fontSize: 10, fontWeight: tab === id ? 700 : 400, color: tab === id ? C.primary : C.muted }}>{label}</span>
-              {tab === id && <div style={{ width: 20, height: 2, borderRadius: 1, background: C.primary }} />}
-            </button>
-          ))}
-        </div>
-      )}
-    </>
-  );
-}
-
-/* ── Hero Banner ─────────────────────────────────────────────────────────── */
-function Hero({ onExplore, onMint }) {
-  const [tick, setTick] = useState(0);
-  const [fi, setFi] = useState(0);
-  const featured = [NFTS[7], NFTS[3], NFTS[0]];
-  const { isMobile, isTablet } = useBreakpoint();
-
-  useEffect(() => {
-    const t1 = setInterval(() => setTick((x) => x + 1), 50);
-    const t2 = setInterval(() => setFi((i) => (i + 1) % 3), 3500);
-    return () => { clearInterval(t1); clearInterval(t2); };
-  }, []);
-
-  return (
-    <div style={{ position: "relative", borderRadius: isMobile ? 16 : 24, overflow: "hidden", border: `1px solid ${C.border}`, minHeight: isMobile ? 280 : 360, display: "flex", flexDirection: isMobile ? "column" : "row", marginBottom: 20 }}>
-      <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0.12 }} preserveAspectRatio="none">
-        <defs>
-          <radialGradient id="hg1" cx="25%" cy="50%"><stop offset="0%" stopColor={C.primary} /><stop offset="100%" stopColor="transparent" /></radialGradient>
-          <radialGradient id="hg2" cx="80%" cy="30%"><stop offset="0%" stopColor={C.secondary} /><stop offset="100%" stopColor="transparent" /></radialGradient>
-        </defs>
-        <rect width="100%" height="100%" fill="#080810" />
-        <rect width="100%" height="100%" fill="url(#hg1)" />
-        <rect width="100%" height="100%" fill="url(#hg2)" />
-      </svg>
-
-      {/* Floating particles — fewer on mobile */}
-      {Array.from({ length: isMobile ? 3 : 6 }, (_, i) => {
-        const ox = 55 + 32 * Math.cos(tick * 0.007 + i * 1.1);
-        const oy = 30 + 25 * Math.sin(tick * 0.005 + i * 0.5);
-        return (
-          <div key={i} style={{ position: "absolute", left: `${ox}%`, top: `${oy}%`, width: i % 2 === 0 ? 5 : 3, height: i % 2 === 0 ? 5 : 3, borderRadius: "50%", background: i % 3 === 0 ? C.primary : i % 3 === 1 ? C.secondary : C.accent, opacity: 0.55, pointerEvents: "none" }} />
-        );
-      })}
-
-      <div style={{ flex: 1, padding: isMobile ? "28px 20px 24px" : "48px 52px", display: "flex", flexDirection: "column", justifyContent: "center", position: "relative", zIndex: 1 }}>
-        <div style={{ display: "inline-flex", gap: 8, alignItems: "center", marginBottom: 14, background: `${C.primary}15`, border: `1px solid ${C.primary}30`, borderRadius: 30, padding: "5px 12px", alignSelf: "flex-start" }}>
-          <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.success, boxShadow: `0 0 8px ${C.success}` }} />
-          <Mono size={10} color={C.primary} weight={700}>927 LIVE LISTINGS</Mono>
-        </div>
-        <h1 style={{ fontSize: isMobile ? 30 : 46, fontWeight: 900, lineHeight: 1.1, letterSpacing: "-0.04em", margin: "0 0 12px", color: C.text }}>
-          The Only<br />
-          <span style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.accent} 40%, ${C.secondary})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Bitcoin-Yield</span><br />
-          NFT Market
-        </h1>
-        <p style={{ fontSize: isMobile ? 13 : 15, color: C.muted, lineHeight: 1.7, maxWidth: 400, margin: "0 0 22px" }}>
-          Trade Proof-of-Yield receipts backed by OP_NET mining rewards. Every NFT earns real Bitcoin.
-        </p>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button onClick={onExplore} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: isMobile ? "11px 22px" : "13px 28px", color: "#fff", fontWeight: 800, fontSize: isMobile ? 13 : 15, cursor: "pointer", fontFamily: "inherit", boxShadow: `0 8px 28px ${C.primary}44` }}>Explore Market</button>
-          <button onClick={onMint} style={{ background: "transparent", border: `1px solid ${C.borderMid}`, borderRadius: 30, padding: isMobile ? "11px 18px" : "13px 24px", color: C.text, fontWeight: 600, fontSize: isMobile ? 13 : 15, cursor: "pointer", fontFamily: "inherit" }}>Mint Yield NFT</button>
-        </div>
-        <div style={{ display: "flex", gap: isMobile ? 18 : 28, marginTop: 24, flexWrap: "wrap" }}>
-          {[["142.8 BTC", "Total Volume"], ["4,291", "NFTs Minted"], ["1,843", "Owners"]].map(([v, l]) => (
-            <div key={l}>
-              <div style={{ fontSize: isMobile ? 16 : 20, fontWeight: 800, fontFamily: "'JetBrains Mono', monospace", color: C.text }}>{v}</div>
-              <div style={{ fontSize: 10, color: C.muted }}>{l}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Featured panel — hidden on mobile */}
-      {!isMobile && (
-        <div style={{ width: isTablet ? 220 : 280, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 28, gap: 14, position: "relative", zIndex: 1 }}>
-          <Mono size={10} color={C.muted} weight={700} style={{ letterSpacing: "0.14em" }}>FEATURED</Mono>
-          <div style={{ borderRadius: 18, overflow: "hidden", boxShadow: `0 0 48px ${RARITY[featured[fi].rarity].glow}` }}>
-            <NFTCanvas nft={featured[fi]} size={isTablet ? 150 : 190} />
-          </div>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{featured[fi].name} #{featured[fi].num}</div>
-            <BtcPrice value={featured[fi].price} size={13} />
-          </div>
-          <div style={{ display: "flex", gap: 6 }}>
-            {[0, 1, 2].map((i) => (
-              <button key={i} onClick={() => setFi(i)} style={{ width: i === fi ? 18 : 6, height: 6, borderRadius: 3, background: i === fi ? C.primary : C.dim, border: "none", cursor: "pointer", transition: "all 0.3s", padding: 0 }} />
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── Testnet Faucet Banner ──────────────────────────────────────────────── */
-// Shown prominently on testnet so new users know where to get tBTC before staking/buying.
-const FAUCETS = [
-  {
-    name: "OP_NET Official Faucet",
-    url: "https://faucet.opnet.org/",
-    amount: "0.05 tBTC / 24h",
-    note: "Taproot address required · Official",
-    icon: "⚡",
-    color: "#FF9F1C",
-    badge: "RECOMMENDED",
-  },
-  {
-    name: "OP_NET Points + Faucet",
-    url: "https://opnet.org/points",
-    amount: "Claim via Points page",
-    note: "Connect OP_WALLET + X account",
-    icon: "🎯",
-    color: "#7B2EDA",
-    badge: "BONUS POINTS",
-  },
-  {
-    name: "Bitcoin Testnet Faucet",
-    url: "https://bitcoinfaucet.uo1.net/",
-    amount: "~0.0001 tBTC",
-    note: "General testnet4 • Returns welcome",
-    icon: "₿",
-    color: "#F7931A",
-    badge: null,
-  },
-];
-
-function FaucetBanner({ onClose }) {
-  const { isMobile } = useBreakpoint();
-  const [dismissed, setDismissed] = useState(false);
-  const [copied, setCopied]       = useState(false);
-
-  if (dismissed) return null;
-
-  const handleCopy = async (url) => {
-    await navigator.clipboard.writeText(url).catch(() => {});
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <div style={{
-      borderRadius: 18, border: `1px solid ${C.primary}44`,
-      background: `linear-gradient(135deg, ${C.primary}0A 0%, ${C.secondary}0A 100%)`,
-      padding: isMobile ? "18px 16px" : "22px 28px",
-      marginBottom: 20, position: "relative", overflow: "hidden",
-    }}>
-      {/* Background glow */}
-      <div style={{ position: "absolute", top: -40, right: -40, width: 180, height: 180, borderRadius: "50%", background: `${C.primary}0C`, pointerEvents: "none" }} />
-
-      {/* Close */}
-      <button
-        onClick={() => { setDismissed(true); onClose?.(); }}
-        style={{ position: "absolute", top: 12, right: 12, background: "none", border: "none", color: C.dim, fontSize: 14, cursor: "pointer", lineHeight: 1 }}
-      >✕</button>
-
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-        <div style={{ width: 36, height: 36, borderRadius: 10, background: `${C.primary}18`, border: `1px solid ${C.primary}33`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>🚰</div>
-        <div>
-          <div style={{ fontSize: isMobile ? 14 : 16, fontWeight: 900, color: C.text, letterSpacing: "-0.02em" }}>
-            Need tBTC? Grab from a faucet first
-          </div>
-          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
-            PoYMarket is on OP_NET testnet — use free tBTC to stake &amp; buy Yield NFTs
-          </div>
-        </div>
-      </div>
-
-      {/* Faucet cards */}
-      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(3,1fr)", gap: 10, marginBottom: 14 }}>
-        {FAUCETS.map((f) => (
-          <a
-            key={f.name}
-            href={f.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: "block", textDecoration: "none",
-              background: C.card, border: `1px solid ${f.color}33`,
-              borderRadius: 13, padding: "12px 14px",
-              transition: "border-color 0.18s, background 0.18s",
-              cursor: "pointer",
-            }}
-            onMouseEnter={(e) => { e.currentTarget.style.borderColor = f.color + "66"; e.currentTarget.style.background = `${f.color}0A`; }}
-            onMouseLeave={(e) => { e.currentTarget.style.borderColor = f.color + "33"; e.currentTarget.style.background = C.card; }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 18 }}>{f.icon}</span>
-                <span style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{f.name}</span>
-              </div>
-              {f.badge && (
-                <span style={{ fontSize: 8, fontWeight: 800, color: f.color, background: `${f.color}18`, border: `1px solid ${f.color}33`, borderRadius: 4, padding: "2px 6px", fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.08em", flexShrink: 0 }}>
-                  {f.badge}
-                </span>
-              )}
-            </div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: f.color, marginBottom: 3 }}>{f.amount}</div>
-            <div style={{ fontSize: 10, color: C.muted }}>{f.note}</div>
-          </a>
-        ))}
-      </div>
-
-      {/* How-to steps */}
-      <div style={{ background: C.card, borderRadius: 12, padding: "12px 14px" }}>
-        <div style={{ fontSize: 10, color: C.muted, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 10 }}>HOW TO GET STARTED ON TESTNET</div>
-        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(4,1fr)", gap: 8 }}>
-          {[
-            ["1", "Install OP_WALLET", "Chrome extension — supports Taproot & MLDSA keys"],
-            ["2", "Claim tBTC", "Visit faucet.opnet.org with your Taproot address · 0.05 tBTC/day"],
-            ["3", "Stake to Mint", "Use tBTC to mint a Proof-of-Yield NFT on PoYMarket"],
-            ["4", "Buy or Trade", "Browse listed Yield NFTs and buy with your tBTC"],
-          ].map(([n, title, desc]) => (
-            <div key={n} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-              <div style={{ width: 22, height: 22, borderRadius: 7, background: `${C.primary}18`, border: `1px solid ${C.primary}33`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: C.primary, flexShrink: 0, marginTop: 1 }}>{n}</div>
-              <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{title}</div>
-                <div style={{ fontSize: 10, color: C.muted, marginTop: 2, lineHeight: 1.4 }}>{desc}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* CTA row */}
-      <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
-        <a
-          href="https://faucet.opnet.org/"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            display: "inline-flex", alignItems: "center", gap: 7,
-            background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`,
-            borderRadius: 30, padding: "9px 20px",
-            color: "#fff", fontWeight: 800, fontSize: 13,
-            textDecoration: "none", fontFamily: "inherit",
-            boxShadow: `0 4px 18px ${C.primary}44`,
-          }}
-        >
-          🚰 Get Free tBTC
-        </a>
-        <a
-          href="https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            display: "inline-flex", alignItems: "center", gap: 7,
-            background: "transparent",
-            border: `1px solid ${C.borderMid}`,
-            borderRadius: 30, padding: "9px 18px",
-            color: C.text, fontWeight: 600, fontSize: 13,
-            textDecoration: "none", fontFamily: "inherit",
-          }}
-        >
-          ⚡ Install OP_WALLET
-        </a>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: C.success, boxShadow: `0 0 7px ${C.success}` }} />
-          <span style={{ fontSize: 11, color: C.muted, fontFamily: "'JetBrains Mono', monospace" }}>TESTNET</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Mint Yield NFT Modal ────────────────────────────────────────────────── */
-function MintModal({ onClose, wallet, onOpenWallet, onToast }) {
-  const { isMobile } = useBreakpoint();
-  const [stakeAmt, setStakeAmt] = useState("");
-  const [txState, setTxState] = useState("idle"); // idle | pending | success | error
-  const [txMsg, setTxMsg]     = useState("");
-  const [txHash, setTxHash]   = useState("");
-
-  const satoshi = (btc) => BigInt(Math.round(parseFloat(btc) * 1e8));
-  const isValid = stakeAmt && !isNaN(parseFloat(stakeAmt)) && parseFloat(stakeAmt) > 0 && parseFloat(stakeAmt) <= 100;
-
-  const TIERS = [
-    { label: "Starter",    btc: "0.01",  apy: "8.2%",  rarity: "Common",    color: "#64748B" },
-    { label: "Miner",      btc: "0.05",  apy: "11.4%", rarity: "Rare",      color: "#3B82F6" },
-    { label: "Validator",  btc: "0.25",  apy: "15.7%", rarity: "Epic",      color: "#9B5CF6" },
-    { label: "Sovereign",  btc: "1.00",  apy: "22.1%", rarity: "Legendary", color: "#FF9F1C" },
-  ];
-
-  const getRarity = (btc) => {
-    const v = parseFloat(btc);
-    if (v >= 1) return TIERS[3];
-    if (v >= 0.25) return TIERS[2];
-    if (v >= 0.05) return TIERS[1];
-    return TIERS[0];
-  };
-  const tier = stakeAmt ? getRarity(stakeAmt) : null;
-
-  useEffect(() => {
-    document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = ""; };
-  }, []);
-
-  const handleMint = async () => {
-    if (!wallet) { onOpenWallet(); return; }
-    if (!isValid) return;
-    setTxState("pending");
-    setTxMsg("Confirm in your wallet — staking BTC to mint your NFT…");
-    try {
-      const result = await sendContractTx("mint", { stakedAmount: satoshi(stakeAmt) }, wallet);
-      setTxHash(result?.txHash || result?.txid || "demo_" + Date.now());
-      setTxState("success");
-      setTxMsg("NFT minted successfully! It will appear in My NFTs after confirmation.");
-      onToast?.("Yield NFT minted ✓ — check My NFTs tab", "success");
-    } catch (e) {
-      setTxState("error");
-      setTxMsg(e.message?.includes("rejected") || e.message?.includes("cancel")
-        ? "Mint cancelled"
-        : e.message || "Mint failed — check your wallet and try again");
-    }
-  };
-
-  return (
-    <div
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, zIndex: 1500, background: "rgba(8,8,15,0.92)", backdropFilter: "blur(20px)", display: "flex", alignItems: isMobile ? "flex-end" : "center", justifyContent: "center", padding: isMobile ? 0 : 24 }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: C.surface, border: `1px solid ${C.primary}33`,
-          borderRadius: isMobile ? "20px 20px 0 0" : 24,
-          width: "100%", maxWidth: 520,
-          maxHeight: isMobile ? "92vh" : "90vh",
-          overflow: "auto",
-          animation: "mIn 0.28s cubic-bezier(0.34,1.56,0.64,1)",
-          boxShadow: `0 40px 100px #00000099, 0 0 0 1px ${C.primary}18`,
-        }}
-      >
-        {/* Header */}
-        <div style={{ padding: "24px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <div style={{ fontSize: 10, color: C.primary, fontWeight: 700, letterSpacing: "0.12em", fontFamily: "'JetBrains Mono', monospace", marginBottom: 6 }}>MINT YIELD NFT</div>
-            <h2 style={{ fontSize: 22, fontWeight: 900, color: C.text, margin: 0, letterSpacing: "-0.02em" }}>Stake BTC → Get NFT</h2>
-            <p style={{ fontSize: 13, color: C.muted, marginTop: 6, lineHeight: 1.6 }}>
-              Deposit Bitcoin to receive a Proof-of-Yield NFT. Your NFT earns BTC rewards every OP_NET epoch.
-            </p>
-          </div>
-          <button onClick={onClose} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: "50%", width: 32, height: 32, cursor: "pointer", color: C.muted, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>✕</button>
-        </div>
-
-        <div style={{ padding: "20px 24px 24px", display: "flex", flexDirection: "column", gap: 18 }}>
-          {/* Quick-select tiers */}
-          <div>
-            <div style={{ fontSize: 11, color: C.muted, marginBottom: 10, fontWeight: 600 }}>QUICK SELECT — STAKE TIER</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              {TIERS.map((t) => (
-                <button
-                  key={t.label}
-                  onClick={() => setStakeAmt(t.btc)}
-                  style={{
-                    background: stakeAmt === t.btc ? `${t.color}20` : C.card,
-                    border: `1px solid ${stakeAmt === t.btc ? t.color + "66" : C.border}`,
-                    borderRadius: 12, padding: "12px 14px", cursor: "pointer",
-                    fontFamily: "inherit", textAlign: "left", transition: "all 0.18s",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: t.color }}>{t.label}</span>
-                    <span style={{ fontSize: 9, fontWeight: 700, color: t.color, background: `${t.color}18`, border: `1px solid ${t.color}33`, borderRadius: 4, padding: "2px 6px", fontFamily: "'JetBrains Mono', monospace" }}>{t.rarity.toUpperCase()}</span>
-                  </div>
-                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 15, fontWeight: 800, color: C.text }}>₿ {t.btc}</div>
-                  <div style={{ fontSize: 10, color: C.success, marginTop: 2 }}>~{t.apy} APY</div>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Custom input */}
-          <div>
-            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, fontWeight: 600 }}>CUSTOM AMOUNT (BTC)</div>
-            <div style={{ position: "relative" }}>
-              <input
-                type="number" min="0.0001" max="100" step="0.001"
-                value={stakeAmt}
-                onChange={(e) => setStakeAmt(e.target.value)}
-                placeholder="e.g. 0.05"
-                style={{
-                  width: "100%", boxSizing: "border-box",
-                  background: C.card, border: `1px solid ${isValid ? C.primary + "55" : C.border}`,
-                  borderRadius: 12, padding: "13px 50px 13px 16px",
-                  color: C.text, fontSize: 16, fontFamily: "'JetBrains Mono', monospace",
-                  fontWeight: 700, outline: "none",
-                }}
-              />
-              <span style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 12, fontWeight: 600 }}>BTC</span>
-            </div>
-            {stakeAmt && !isValid && (
-              <div style={{ fontSize: 11, color: C.danger, marginTop: 6 }}>
-                {parseFloat(stakeAmt) <= 0 ? "Amount must be greater than 0" : "Maximum 100 BTC per mint (use mintFor for larger amounts)"}
-              </div>
-            )}
-          </div>
-
-          {/* Rarity preview */}
-          {tier && isValid && (
-            <div style={{ background: `${tier.color}10`, border: `1px solid ${tier.color}33`, borderRadius: 14, padding: "14px 16px" }}>
-              <div style={{ fontSize: 10, color: C.muted, marginBottom: 8, letterSpacing: "0.08em" }}>YOU WILL RECEIVE</div>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 800, color: tier.color }}>{tier.rarity} Yield NFT</div>
-                  <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>₿{parseFloat(stakeAmt).toFixed(4)} staked · ~{tier.apy} APY</div>
-                </div>
-                <div style={{ fontSize: 36 }}>⚡</div>
-              </div>
-              <div style={{ marginTop: 10, display: "flex", gap: 16 }}>
-                <div>
-                  <div style={{ fontSize: 9, color: C.muted }}>EST. DAILY YIELD</div>
-                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: C.success }}>
-                    ₿ {(parseFloat(stakeAmt) * parseFloat(tier.apy) / 100 / 365).toFixed(6)}
-                  </div>
-                </div>
-                <div>
-                  <div style={{ fontSize: 9, color: C.muted }}>EST. YEARLY YIELD</div>
-                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: C.success }}>
-                    ₿ {(parseFloat(stakeAmt) * parseFloat(tier.apy) / 100).toFixed(4)}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* How it works — compact */}
-          <div style={{ background: C.card, borderRadius: 12, padding: "12px 14px" }}>
-            <div style={{ fontSize: 10, color: C.muted, fontWeight: 700, marginBottom: 8, letterSpacing: "0.08em" }}>HOW MINTING WORKS</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-              {[
-                ["1", "Send BTC to the PoY staking vault on Bitcoin"],
-                ["2", "Contract records your stake as a Yield NFT"],
-                ["3", "NFT earns BTC rewards each OP_NET epoch"],
-                ["4", "Trade your NFT anytime — yield transfers with it"],
-              ].map(([n, t]) => (
-                <div key={n} style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <div style={{ width: 20, height: 20, borderRadius: 6, background: `${C.primary}18`, border: `1px solid ${C.primary}33`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 800, color: C.primary, flexShrink: 0 }}>{n}</div>
-                  <span style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>{t}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* TX status */}
-          {txState !== "idle" && (
-            <div style={{
-              borderRadius: 12, padding: "12px 16px",
-              background: txState === "error" ? `${C.danger}18` : txState === "success" ? `${C.success}18` : `${C.primary}18`,
-              border: `1px solid ${txState === "error" ? C.danger : txState === "success" ? C.success : C.primary}44`,
-              display: "flex", alignItems: "center", gap: 10,
-            }}>
-              {txState === "pending" && <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${C.primary}44`, borderTopColor: C.primary, animation: "spin 0.7s linear infinite", flexShrink: 0 }} />}
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: txState === "error" ? C.danger : txState === "success" ? C.success : C.primary }}>{txMsg}</div>
-                {txHash && txState === "success" && (
-                  <div style={{ fontSize: 10, color: C.muted, marginTop: 3, fontFamily: "'JetBrains Mono', monospace" }}>
-                    TX: {txHash.slice(0, 20)}…
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Mint button */}
-          <button
-            onClick={handleMint}
-            disabled={txState === "pending" || (wallet && !isValid)}
-            style={{
-              width: "100%",
-              background: txState === "pending"
-                ? C.dim
-                : txState === "success"
-                ? C.success
-                : `linear-gradient(90deg, ${C.primary}, ${C.secondary})`,
-              border: "none", borderRadius: 30, padding: "15px 0",
-              color: "#fff", fontWeight: 800, fontSize: 16,
-              cursor: txState === "pending" || (wallet && !isValid) ? "not-allowed" : "pointer",
-              fontFamily: "inherit",
-              boxShadow: txState === "pending" ? "none" : `0 8px 28px ${C.primary}44`,
-              transition: "background 0.3s",
-            }}
-          >
-            {txState === "pending"
-              ? "⏳ Minting…"
-              : txState === "success"
-              ? "✓ NFT Minted!"
-              : !wallet
-              ? "🔌 Connect Wallet to Mint"
-              : !isValid && stakeAmt
-              ? "Invalid Amount"
-              : "⚡ Mint Yield NFT"}
-          </button>
-
-          {/* Faucet nudge in MintModal */}
-          <div style={{ background: `${C.primary}08`, border: `1px dashed ${C.primary}33`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12 }}>
-            <span style={{ fontSize: 22, flexShrink: 0 }}>🚰</span>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>Need tBTC for testnet staking?</div>
-              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>Claim 0.05 tBTC free every 24 hours — no cost, no sign-up</div>
-            </div>
-            <a
-              href="https://faucet.opnet.org/" target="_blank" rel="noopener noreferrer"
-              style={{ background: `${C.primary}18`, border: `1px solid ${C.primary}44`, borderRadius: 20, padding: "7px 14px", color: C.primary, fontWeight: 700, fontSize: 11, textDecoration: "none", fontFamily: "inherit", whiteSpace: "nowrap", flexShrink: 0 }}
-            >Get tBTC →</a>
-          </div>
-
-          <p style={{ fontSize: 11, color: C.dim, textAlign: "center", margin: 0, lineHeight: 1.5 }}>
-            Non-custodial · Audited · PoYMarket v7 · OP_NET Bitcoin L2 · Testnet
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── About / Platform Description ───────────────────────────────────────── */
-function AboutSection() {
-  const PILLARS = [
-    {
-      icon: "₿",
-      color: C.primary,
-      title: "Real Bitcoin Yield",
-      body:
-        "Every PoY NFT is a Proof-of-Yield receipt minted on OP_NET. It represents a verified Bitcoin stake position that earns rewards from each mining epoch — automatically accrued on-chain, claimable at any time.",
-    },
-    {
-      icon: "⛓",
-      color: C.secondary,
-      title: "Bitcoin-Native Protocol",
-      body:
-        "PoY Market is built entirely on OP_NET — a Bitcoin Layer 2 that executes smart contracts while settling on the Bitcoin base layer. No wrapped BTC, no bridging, no EVM. Pure Bitcoin security from block one.",
-    },
-    {
-      icon: "🔒",
-      color: C.success,
-      title: "Verify-Don't-Custody",
-      body:
-        "The PoYMarket contract never holds or moves BTC. Every trade settles via real Bitcoin UTXOs — seller receives BTC on-chain before ownership transfers on OP_NET. The contract is a record-keeper, not a custodian.",
-    },
-    {
-      icon: "⚡",
-      color: C.accent,
-      title: "Quantum-Safe Wallets",
-      body:
-        "OP_WALLET uses MLDSA (Module Lattice Digital Signature Algorithm) — a NIST-standardised post-quantum signature scheme. Your assets are protected against both classical and quantum adversaries.",
-    },
-  ];
-
-  const HOW = [
-    { n: "01", label: "Stake BTC",     detail: "Deposit Bitcoin into the PoY Protocol and receive a Proof-of-Yield NFT representing your staked position." },
-    { n: "02", label: "Earn Yield",    detail: "Your NFT accrues BTC rewards each epoch from OP_NET mining revenue, proportional to your stake weight." },
-    { n: "03", label: "Trade or Hold", detail: "List your yield-bearing NFT on PoY Market. New owners inherit the staking position and continue earning." },
-    { n: "04", label: "Claim Anytime", detail: "Unclaimed yield accumulates on-chain. Call claimYield() at any time — no lock-up, no expiry, no friction." },
-  ];
-
-  return (
-    <div style={{ marginBottom: 56 }}>
-      {/* ── Section header ── */}
-      <div style={{ textAlign: "center", marginBottom: 40 }}>
-        <div style={{ display: "inline-flex", gap: 8, alignItems: "center", background: `${C.secondary}14`, border: `1px solid ${C.secondary}30`, borderRadius: 30, padding: "5px 16px", marginBottom: 16 }}>
-          <span style={{ fontSize: 10, color: C.secondary, fontWeight: 700, letterSpacing: "0.14em", fontFamily: "'JetBrains Mono', monospace" }}>WHAT IS POY MARKET</span>
-        </div>
-        <h2 style={{ fontSize: 34, fontWeight: 900, letterSpacing: "-0.03em", color: C.text, margin: "0 0 14px", lineHeight: 1.1 }}>
-          Bitcoin Yield,{" "}
-          <span style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.accent} 50%, ${C.secondary})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-            Tokenised.
-          </span>
-        </h2>
-        <p style={{ fontSize: 15, color: C.muted, lineHeight: 1.8, maxWidth: 600, margin: "0 auto" }}>
-          PoY Market is the first marketplace for yield-bearing NFTs backed by real Bitcoin stakes on OP_NET.
-          Buy, sell, and hold positions that keep earning — long after the trade settles.
-        </p>
-      </div>
-
-      {/* ── 4-pillar grid ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginBottom: 40 }}>
-        {PILLARS.map((p) => (
-          <div
-            key={p.title}
-            style={{
-              background: C.card,
-              border: `1px solid ${C.border}`,
-              borderRadius: 18,
-              padding: "26px 24px",
-              transition: "border-color 0.25s, transform 0.25s",
-              cursor: "default",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.borderColor = p.color + "44";
-              e.currentTarget.style.transform = "translateY(-4px)";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.borderColor = C.border;
-              e.currentTarget.style.transform = "translateY(0)";
-            }}
-          >
-            <div style={{
-              width: 46, height: 46, borderRadius: 13,
-              background: p.color + "18",
-              border: `1px solid ${p.color}33`,
-              display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 22, marginBottom: 16,
-            }}>
-              {p.icon}
-            </div>
-            <div style={{ fontSize: 15, fontWeight: 800, color: C.text, marginBottom: 10 }}>{p.title}</div>
-            <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.75, margin: 0 }}>{p.body}</p>
-          </div>
-        ))}
-      </div>
-
-      {/* ── How it works ── */}
-      <div style={{
-        background: `linear-gradient(135deg, ${C.primary}08, ${C.secondary}08)`,
-        border: `1px solid ${C.border}`,
-        borderRadius: 20,
-        padding: "clamp(20px,4vw,36px) clamp(16px,3vw,36px) clamp(18px,3vw,32px)",
-      }}>
-        <div style={{ fontSize: 12, fontWeight: 700, color: C.primary, letterSpacing: "0.12em", fontFamily: "'JetBrains Mono', monospace", marginBottom: 10 }}>
-          HOW IT WORKS
-        </div>
-        <h3 style={{ fontSize: 22, fontWeight: 900, color: C.text, margin: "0 0 28px", letterSpacing: "-0.02em" }}>
-          Four steps. Real Bitcoin.
-        </h3>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 24 }}>
-          {HOW.map((step, i) => (
-            <div key={step.n} style={{ position: "relative" }}>
-              {/* Connector line between steps (desktop) */}
-              {i < HOW.length - 1 && (
-                <div style={{
-                  display: "none", // shown via inline for desktop widths; kept simple here
-                }} />
-              )}
-              <div style={{
-                width: 36, height: 36, borderRadius: 10,
-                background: `linear-gradient(135deg, ${C.primary}22, ${C.secondary}22)`,
-                border: `1px solid ${C.primary}44`,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                fontFamily: "'JetBrains Mono', monospace",
-                fontSize: 12, fontWeight: 700, color: C.primary,
-                marginBottom: 12,
-              }}>
-                {step.n}
-              </div>
-              <div style={{ fontSize: 14, fontWeight: 800, color: C.text, marginBottom: 7 }}>{step.label}</div>
-              <p style={{ fontSize: 12, color: C.muted, lineHeight: 1.7, margin: 0 }}>{step.detail}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Bottom trust strip */}
-        <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 28, paddingTop: 20, display: "flex", gap: 28, flexWrap: "wrap" }}>
-          {[
-            ["🛡", "Non-custodial", "Your BTC never leaves your control"],
-            ["📜", "Audited Contract", "PoYMarket v7 — full security audit completed"],
-            ["⛓", "Bitcoin L2", "Settled on Bitcoin via OP_NET"],
-            ["🔑", "MLDSA Keys", "Post-quantum wallet signatures"],
-          ].map(([icon, label, sub]) => (
-            <div key={label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span style={{ fontSize: 16 }}>{icon}</span>
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{label}</div>
-                <div style={{ fontSize: 10, color: C.muted }}>{sub}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-
-function DropBanner() {
-  const { h, m, s } = useCountdown(Date.now() + 10 * 3600000 + 24 * 60000);
-  return (
-    <div style={{ background: `linear-gradient(100deg, ${C.primary}18, ${C.secondary}18)`, border: `1px solid ${C.primary}33`, borderRadius: 18, padding: "18px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 32, flexWrap: "wrap", gap: 16 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-        <span style={{ fontSize: 32 }}>🔥</span>
-        <div>
-          <div style={{ fontSize: 10, color: C.primary, fontWeight: 700, letterSpacing: "0.12em", marginBottom: 3 }}>UPCOMING DROP</div>
-          <div style={{ fontSize: 18, fontWeight: 800, color: C.text }}>PoY Genesis Season II</div>
-          <div style={{ fontSize: 11, color: C.muted }}>100 exclusive Legendary yield NFTs — whitelisted wallets only</div>
-        </div>
-      </div>
-      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-        <div style={{ display: "flex", gap: 8 }}>
-          {[["HRS", h], ["MIN", m], ["SEC", s]].map(([l, v]) => (
-            <div key={l} style={{ background: C.card, borderRadius: 10, padding: "8px 12px", textAlign: "center", minWidth: 52 }}>
-              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: C.primary, lineHeight: 1 }}>{String(v).padStart(2, "0")}</div>
-              <div style={{ fontSize: 8, color: C.muted, letterSpacing: "0.1em", marginTop: 3 }}>{l}</div>
-            </div>
-          ))}
-        </div>
-        <button style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: "11px 22px", color: "#fff", fontWeight: 800, fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>Whitelist Me</button>
-      </div>
-    </div>
-  );
-}
-
-/* ── Creators Row ────────────────────────────────────────────────────────── */
-function CreatorsRow() {
-  return (
-    <div style={{ marginBottom: 36 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-        <h3 style={{ fontSize: 16, fontWeight: 700, color: C.text, margin: 0 }}>Top Creators</h3>
-        <button style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 13px", color: C.muted, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>View All</button>
-      </div>
-      <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 4 }}>
-        {Object.values(CREATORS).map((cr) => (
-          <div key={cr.name} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: "13px 16px", display: "flex", alignItems: "center", gap: 11, flexShrink: 0, cursor: "pointer", transition: "border-color 0.2s", minWidth: 190 }}
-            onMouseEnter={(e) => { e.currentTarget.style.borderColor = cr.color + "55"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.borderColor = C.border; }}
-          >
-            <div style={{ width: 40, height: 40, borderRadius: "50%", background: `${cr.color}22`, border: `2px solid ${cr.color}44`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17, flexShrink: 0 }}>{cr.avatar}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{cr.name}</span>
-                {cr.verified && <span style={{ color: C.primary, fontSize: 10 }}>✓</span>}
-              </div>
-              <Mono size={10} color={C.muted}>{cr.volume}</Mono>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/* ── Recently Viewed ─────────────────────────────────────────────────────── */
-function RecentRail({ items, onOpen }) {
-  if (!items || items.length === 0) return null;
-  return (
-    <div style={{ marginBottom: 36 }}>
-      <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 13 }}>Recently Viewed</div>
-      <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 4 }}>
-        {items.map((nft) => {
-          const r = RARITY[nft.rarity] || RARITY.Common;
-          return (
-            <div key={nft.id} onClick={() => onOpen(nft)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 13, overflow: "hidden", cursor: "pointer", flexShrink: 0, width: 135, transition: "border-color 0.2s, transform 0.2s" }}
-              onMouseEnter={(e) => { e.currentTarget.style.borderColor = r.color + "55"; e.currentTarget.style.transform = "translateY(-3px)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.transform = "translateY(0)"; }}
-            >
-              <NFTCanvas nft={nft} size={135} />
-              <div style={{ padding: "7px 9px" }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nft.name}</div>
-                <BtcPrice value={nft.listed ? nft.price : nft.lastSale} size={11} />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/* ── Marketplace Tab ─────────────────────────────────────────────────────── */
-const CATS = ["All", "Legendary", "Epic", "Rare", "Common", "Auction", "Listed"];
-
-function MarketTab({ onOpen, recentlyViewed, onMint }) {
-  // Testnet mode: show faucet banner by default until user dismisses it
-  const [cat, setCat] = useState("All");
-  const [sort, setSort] = useState("Trending");
-  const [view, setView] = useState("grid");
-  const exploreRef = useRef(null);
-
-  const filtered = useMemo(() => {
-    return NFTS.filter((n) => {
-      if (cat === "All") return true;
-      if (cat === "Listed") return n.listed;
-      if (cat === "Auction") return n.auction;
-      return n.rarity === cat;
-    }).sort((a, b) => {
-      switch (sort) {
-        case "Trending":    return b.views - a.views;
-        case "Price ↑":    return (a.price || 0) - (b.price || 0);
-        case "Price ↓":    return (b.price || 0) - (a.price || 0);
-        case "Yield ↓":    return b.yield - a.yield;
-        case "Newest":     return b.epoch - a.epoch;
-        case "Most Liked": return b.likes - a.likes;
-        default:           return 0;
-      }
-    });
-  }, [cat, sort]);
-
-  return (
-    <div>
-      <Hero onMint={onMint} onExplore={() => exploreRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })} />
-
-      {/* Stats grid */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 1, background: C.border, borderRadius: 14, overflow: "hidden", marginBottom: 20 }}>
-        {[["Total Volume","142.8 BTC","+8.2%",true],["Floor","₿0.004","+2.1%",true],["24h Sales","34","+12",true],["Listed","28.4%","-1.2%",false],["Owners","1,843","+34",true],["Avg APY","17.3%","+0.9%",true]].map(([l,v,d,pos]) => (
-          <div key={l} style={{ background: C.surface, padding: "15px 16px", textAlign: "center" }}>
-            <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.07em", marginBottom: 4 }}>{l}</div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 3 }}>{v}</div>
-            <div style={{ fontSize: 10, color: pos ? C.success : C.danger, fontFamily: "'JetBrains Mono', monospace" }}>{d}</div>
-          </div>
-        ))}
-      </div>
-
-      <FaucetBanner />
-      <AboutSection />
-      <DropBanner />
-      <CreatorsRow />
-      <RecentRail items={recentlyViewed} onOpen={onOpen} />
-
-      {/* Filter bar */}
-      <div ref={exploreRef} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
-        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-          {CATS.map((c) => (
-            <button key={c} onClick={() => setCat(c)} style={{ background: cat === c ? `linear-gradient(90deg,${C.primary}2A,${C.secondary}2A)` : C.card, border: `1px solid ${cat === c ? C.primary + "55" : C.border}`, borderRadius: 30, padding: "6px 15px", color: cat === c ? C.primary : C.muted, fontSize: 12, fontWeight: cat === c ? 700 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.18s" }}>
-              {c}
-            </button>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <select value={sort} onChange={(e) => setSort(e.target.value)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "7px 12px", color: C.text, fontSize: 12, fontFamily: "inherit", outline: "none", cursor: "pointer" }}>
-            {["Trending","Price ↑","Price ↓","Yield ↓","Newest","Most Liked"].map((o) => <option key={o}>{o}</option>)}
-          </select>
-          <div style={{ display: "flex", gap: 3 }}>
-            {[["grid","⊞"],["list","☰"]].map(([v, ico]) => (
-              <button key={v} onClick={() => setView(v)} style={{ background: view === v ? `${C.primary}22` : C.card, border: `1px solid ${view === v ? C.primary + "55" : C.border}`, borderRadius: 8, width: 34, height: 34, color: view === v ? C.primary : C.muted, fontSize: 15, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{ico}</button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {view === "grid" ? (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 18 }}>
-          {filtered.map((nft) => <NFTCard key={nft.id} nft={nft} onOpen={onOpen} />)}
-        </div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {filtered.map((nft) => {
-            const r2 = RARITY[nft.rarity] || RARITY.Common;
-            return (
-              <div key={nft.id} onClick={() => onOpen(nft)} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto auto auto auto", alignItems: "center", gap: 16, background: C.card, border: `1px solid ${C.border}`, borderRadius: 13, padding: "12px 16px", cursor: "pointer", transition: "border-color 0.18s, background 0.18s" }}
-                onMouseEnter={(e) => { e.currentTarget.style.borderColor = r2.color + "44"; e.currentTarget.style.background = C.cardHov; }}
-                onMouseLeave={(e) => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.card; }}
-              >
-                <div style={{ width: 46, height: 46, borderRadius: 10, background: "#09090F", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>{nft.img}</div>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{nft.name} <Mono size={11} color={C.muted}>#{nft.num}</Mono></div>
-                  <Mono size={10} color={C.muted}>Epoch #{nft.epoch}</Mono>
-                </div>
-                <RarityBadge rarity={nft.rarity} tiny />
-                <div style={{ textAlign: "right" }}>
-                  <BtcPrice value={nft.listed ? nft.price : nft.lastSale} size={14} />
-                  <div style={{ fontSize: 9, color: C.muted }}>{nft.listed ? "listed" : "last sale"}</div>
-                </div>
-                <Mono size={11} color={C.success}>+{nft.yield.toFixed(3)} BTC</Mono>
-                {nft.auction && nft.auctionEnd && <CountdownInline endMs={nft.auctionEnd} />}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── My NFTs Tab ─────────────────────────────────────────────────────────── */
-/* ── MyNFT action card — list / delist / claim with real on-chain calls ── */
-function MyNFTActionCard({ nft, wallet, onOpen, onToast }) {
-  const r = RARITY[nft.rarity] || RARITY.Common;
-  const [listPrice, setListPrice] = useState("");
-  const [showList, setShowList] = useState(false);
-  const [txState, setTxState] = useState("idle"); // idle | pending | success | error
-  const [txMsg,   setTxMsg]   = useState("");
-
-  const busy = txState === "pending";
-
-  const toast = (msg, type = "success") => onToast?.(msg, type);
-
-  const run = async (endpoint, body, label) => {
-    setTxState("pending");
-    setTxMsg(`Confirm in wallet…`);
-    try {
-      const result = await sendContractTx(endpoint, body, wallet);
-      setTxState("success");
-      setTxMsg(result?.demo ? `${label} (demo mode)` : `${label} ✓`);
-      toast(`${label} ✓`, "success");
-      setTimeout(() => { setTxState("idle"); setTxMsg(""); }, 4000);
-    } catch (e) {
-      const msg = e?.message ?? "";
-      setTxState("error");
-      setTxMsg(msg.includes("rejected") || msg.includes("cancel") ? "Cancelled" : msg || "Transaction failed");
-      setTimeout(() => { setTxState("idle"); setTxMsg(""); }, 4000);
-    }
-  };
-
-  const handleList = async () => {
-    const v = parseFloat(listPrice);
-    if (!listPrice || isNaN(v) || v <= 0) return;
-    const priceSats = Math.round(v * 1e8);
-    await run("list", { tokenId: nft.id, priceSats }, `Listed ${nft.name} for ₿${v.toFixed(4)}`);
-    setShowList(false);
-    setListPrice("");
-  };
-
-  const handleDelist = () => run("delist", { tokenId: nft.id }, `${nft.name} delisted`);
-  const handleClaim  = () => run("claim",  { tokenId: nft.id }, `Yield claimed for ${nft.name}`);
-
-  const btnBase = {
-    border: "none", borderRadius: 20, padding: "7px 14px",
-    fontSize: 11, fontWeight: 700, cursor: busy ? "not-allowed" : "pointer",
-    fontFamily: "inherit", opacity: busy ? 0.6 : 1, transition: "opacity 0.2s",
-  };
-
-  return (
-    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 20, overflow: "hidden" }}>
-      {/* Thumbnail row */}
-      <div
-        onClick={() => onOpen(nft)}
-        style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", cursor: "pointer" }}
-      >
-        <div style={{ width: 48, height: 48, borderRadius: 10, background: "#09090F", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, flexShrink: 0 }}>
-          {nft.img}
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nft.name}</div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 2 }}>
-            <RarityBadge rarity={nft.rarity} tiny />
-            <Mono size={10} color={C.muted}>#{nft.num} · E{nft.epoch}</Mono>
-          </div>
-        </div>
-        <div style={{ textAlign: "right", flexShrink: 0 }}>
-          <Mono size={10} color={C.muted}>YIELD</Mono>
-          <Mono size={12} color={C.success}>+{nft.yield.toFixed(3)}</Mono>
-        </div>
-      </div>
-
-      {/* Status bar */}
-      {txMsg && (
-        <div style={{
-          margin: "0 12px 8px", padding: "6px 12px", borderRadius: 10, fontSize: 11,
-          background: txState === "success" ? `${C.success}18` : txState === "error" ? `${C.danger}18` : `${C.primary}18`,
-          color: txState === "success" ? C.success : txState === "error" ? C.danger : C.primary,
-          border: `1px solid ${txState === "success" ? C.success : txState === "error" ? C.danger : C.primary}33`,
-        }}>
-          {txState === "pending" && "⏳ "}{txMsg}
-        </div>
-      )}
-
-      {/* List price input (shown on demand) */}
-      {showList && !nft.listed && (
-        <div style={{ display: "flex", gap: 6, margin: "0 12px 8px" }}>
-          <input
-            value={listPrice}
-            onChange={(e) => setListPrice(e.target.value)}
-            placeholder="Price in BTC (e.g. 0.05)"
-            type="number" min="0" step="0.001"
-            style={{
-              flex: 1, background: "#09090F", border: `1px solid ${C.border}`, borderRadius: 10,
-              padding: "7px 10px", color: C.text, fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
-              outline: "none",
-            }}
-          />
-          <button
-            onClick={handleList}
-            disabled={busy || !listPrice}
-            style={{ ...btnBase, background: `linear-gradient(90deg,${C.primary},${C.secondary})`, color: "#fff", padding: "7px 16px" }}
-          >List</button>
-          <button
-            onClick={() => { setShowList(false); setListPrice(""); }}
-            style={{ ...btnBase, background: `${C.muted}22`, color: C.muted, padding: "7px 12px" }}
-          >✕</button>
-        </div>
-      )}
-
-      {/* Action buttons */}
-      <div style={{ display: "flex", gap: 6, padding: "0 12px 13px", flexWrap: "wrap" }}>
-        {nft.listed ? (
-          <button onClick={handleDelist} disabled={busy}
-            style={{ ...btnBase, background: `${C.danger}18`, color: C.danger, border: `1px solid ${C.danger}33` }}>
-            Delist
-          </button>
-        ) : (
-          <button onClick={() => setShowList(!showList)} disabled={busy}
-            style={{ ...btnBase, background: `${C.primary}18`, color: C.primary, border: `1px solid ${C.primary}33` }}>
-            List for Sale
-          </button>
-        )}
-        <button onClick={handleClaim} disabled={busy}
-          style={{ ...btnBase, background: `${C.success}18`, color: C.success, border: `1px solid ${C.success}33` }}>
-          Claim Yield
-        </button>
-        <button onClick={() => onOpen(nft)}
-          style={{ ...btnBase, background: "none", color: C.muted, border: `1px solid ${C.border}` }}>
-          Details
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function MyNFTsTab({ wallet, onOpenWallet, onOpen, onToast }) {
-  const mine = NFTS.filter((n) => n.owner === "bc1q...x9f2");
-  const totalYield = mine.reduce((s, n) => s + n.yield, 0);
-
-  if (!wallet) {
-    return (
-      <div style={{ textAlign: "center", padding: "100px 0" }}>
-        <div style={{ fontSize: 56, marginBottom: 18 }}>🔐</div>
-        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 10 }}>Connect Your Wallet</h2>
-        <p style={{ color: C.muted, marginBottom: 26, fontSize: 14 }}>View your Proof-of-Yield NFTs, portfolio stats, and earnings</p>
-        <button onClick={onOpenWallet} style={{ background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, border: "none", borderRadius: 30, padding: "13px 32px", color: "#fff", fontWeight: 700, fontSize: 15, cursor: "pointer", fontFamily: "inherit" }}>Connect Wallet</button>
-      </div>
-    );
-  }
-
-  return (
-    <div>
-      <div style={{ background: `linear-gradient(120deg,${C.primary}0E,${C.secondary}0E)`, border: `1px solid ${C.primary}22`, borderRadius: 22, padding: "26px 30px", marginBottom: 28 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-          <span style={{ fontSize: 18 }}>{wallet.walletIcon}</span>
-          <Mono size={12} color={C.text}>{wallet.address}</Mono>
-          <span style={{ background: `${C.success}18`, color: C.success, border: `1px solid ${C.success}33`, borderRadius: 20, padding: "2px 9px", fontSize: 10, fontWeight: 700 }}>CONNECTED</span>
-          <Mono size={11} color={C.muted}>via {wallet.walletName}</Mono>
-        </div>
-        <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>PORTFOLIO VALUE</div>
-        <div style={{ fontSize: 36, fontWeight: 900, fontFamily: "'JetBrains Mono', monospace", color: C.text, marginBottom: 18 }}>₿ <span style={{ color: C.primary }}>0.1210</span></div>
-        <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
-          {[[`${mine.length}`, "NFTs Owned"], [`₿ ${totalYield.toFixed(4)}`, "Total Yield"], ["16.8%", "Avg APY"], ["3 Active", "Staked"]].map(([v, l]) => (
-            <div key={l}>
-              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 17, fontWeight: 700, color: C.text }}>{v}</div>
-              <div style={{ fontSize: 11, color: C.muted }}>{l}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-      {mine.length === 0 ? (
-        <div style={{ textAlign: "center", padding: "60px 0", color: C.muted }}>
-          <div style={{ fontSize: 48, marginBottom: 16 }}>🪙</div>
-          <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>No NFTs yet</div>
-          <div style={{ fontSize: 13 }}>Mint your first Proof-of-Yield NFT to get started.</div>
-        </div>
-      ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 }}>
-          {mine.map((nft) => (
-            <MyNFTActionCard key={nft.id} nft={nft} wallet={wallet} onOpen={onOpen} onToast={onToast} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── Activity Tab ────────────────────────────────────────────────────────── */
-function ActivityTab() {
-  const [filter, setFilter] = useState("All");
-  const TYPE_STYLES = {
-    Sale:     { bg: `${C.success}18`, color: C.success },
-    Bid:      { bg: `${C.primary}18`, color: C.primary },
-    List:     { bg: `${C.accent}18`,  color: C.accent  },
-    Mint:     { bg: `${C.info}18`,    color: C.info    },
-    Transfer: { bg: `${C.muted}18`,   color: C.muted   },
-    Offer:    { bg: "#9B5CF618",       color: "#9B5CF6" },
-  };
-  const ACTIVITY_DATA = [
-    { type:"Sale",     nft:NFTS[3],  from:"bc1q...p3k1", to:"bc1q...f8a2",  price:0.174, time:"14s ago"  },
-    { type:"Bid",      nft:NFTS[7],  from:"bc1q...aa1c", to:"—",            price:0.248, time:"42s ago"  },
-    { type:"List",     nft:NFTS[13], from:"bc1q...lv9n", to:"—",            price:0.047, time:"2m ago"   },
-    { type:"Sale",     nft:NFTS[0],  from:"bc1q...f8a2", to:"bc1q...x9f2",  price:0.130, time:"8m ago"   },
-    { type:"Offer",    nft:NFTS[1],  from:"bc1q...r2k9", to:"bc1q...x9f2",  price:0.052, time:"12m ago"  },
-    { type:"Mint",     nft:NFTS[9],  from:"Protocol",    to:"bc1q...x9f2",  price:null,  time:"18m ago"  },
-    { type:"Transfer", nft:NFTS[6],  from:"bc1q...x9f2", to:"bc1q...bb3d",  price:null,  time:"1h ago"   },
-    { type:"Sale",     nft:NFTS[5],  from:"bc1q...mn2z", to:"bc1q...aa1c",  price:0.014, time:"2h ago"   },
-    { type:"Bid",      nft:NFTS[0],  from:"bc1q...cc5e", to:"—",            price:0.138, time:"2h ago"   },
-    { type:"List",     nft:NFTS[14], from:"bc1q...mm3p", to:"—",            price:0.174, time:"3h ago"   },
-  ];
-
-  const visible = ACTIVITY_DATA.filter((a) => filter === "All" || a.type === filter);
-
-  return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 22 }}>
-        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, margin: 0 }}>Live <span style={{ color: C.primary }}>Activity</span></h2>
-        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-          {["All","Sale","Bid","Offer","List","Mint","Transfer"].map((t) => (
-            <button key={t} onClick={() => setFilter(t)} style={{ background: filter === t ? `${C.primary}22` : "none", border: `1px solid ${filter === t ? C.primary+"55" : C.border}`, borderRadius: 20, padding: "5px 12px", color: filter === t ? C.primary : C.muted, fontSize: 11, fontWeight: filter === t ? 700 : 400, cursor: "pointer", fontFamily: "inherit" }}>{t}</button>
-          ))}
-        </div>
-      </div>
-      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, overflow: "hidden" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
-              {["Event","NFT","From","To","Price","Yield","Time"].map((h) => (
-                <th key={h} style={{ padding: "12px 16px", textAlign: "left", fontSize: 10, color: C.muted, fontWeight: 600, letterSpacing: "0.09em" }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((a, i) => {
-              const ts = TYPE_STYLES[a.type] || TYPE_STYLES.Transfer;
-              return (
-                <tr key={i} style={{ borderBottom: `1px solid ${C.border}50`, cursor: "pointer" }}
-                  onMouseEnter={(e) => { e.currentTarget.style.background = "#FFFFFF04"; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                >
-                  <td style={{ padding: "12px 16px" }}>
-                    <span style={{ background: ts.bg, color: ts.color, border: `1px solid ${ts.color}33`, borderRadius: 5, padding: "2px 8px", fontSize: 9, fontWeight: 800, fontFamily: "'JetBrains Mono', monospace" }}>{a.type.toUpperCase()}</span>
-                  </td>
-                  <td style={{ padding: "12px 16px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontSize: 18 }}>{a.nft.img}</span>
-                      <div>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{a.nft.name}</div>
-                        <RarityBadge rarity={a.nft.rarity} tiny />
-                      </div>
-                    </div>
-                  </td>
-                  <td style={{ padding: "12px 16px" }}><Mono size={11} color={C.muted}>{a.from}</Mono></td>
-                  <td style={{ padding: "12px 16px" }}><Mono size={11} color={C.muted}>{a.to}</Mono></td>
-                  <td style={{ padding: "12px 16px" }}><BtcPrice value={a.price} size={13} /></td>
-                  <td style={{ padding: "12px 16px" }}><Mono size={11} color={C.success}>+{a.nft.yield.toFixed(3)}</Mono></td>
-                  <td style={{ padding: "12px 16px" }}><Mono size={11} color={C.muted}>{a.time}</Mono></td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-/* ── Analytics Tab ───────────────────────────────────────────────────────── */
-function AnalyticsTab() {
-  const volData = [12, 18, 14, 22, 19, 28, 24, 31, 26, 38, 34, 42, 39, 48];
-  const maxVol = Math.max(...volData);
-
-  return (
-    <div>
-      <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 26 }}>Protocol <span style={{ color: C.primary }}>Analytics</span></h2>
-
-      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 22, padding: "26px 30px", marginBottom: 22 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-          <div>
-            <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>14-DAY VOLUME</div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 26, fontWeight: 800, color: C.text }}>142.8 <span style={{ fontSize: 15, color: C.primary }}>BTC</span></div>
-          </div>
-          <Mono size={13} color={C.success}>▲ +8.2% vs prev period</Mono>
-        </div>
-        <div style={{ display: "flex", gap: 5, alignItems: "flex-end", height: 120 }}>
-          {volData.map((v, i) => (
-            <div key={i} title={`${v} BTC`} style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
-              <div style={{ height: `${(v / maxVol) * 110}px`, background: i === volData.length - 1 ? `linear-gradient(180deg,${C.primary},${C.secondary})` : `linear-gradient(180deg,${C.primary}88,${C.primary}22)`, borderRadius: "5px 5px 0 0", transition: "opacity 0.2s" }}
-                onMouseEnter={(e) => { e.currentTarget.style.opacity = "0.7"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; }}
-              />
-            </div>
-          ))}
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
-          <Mono size={10} color={C.muted}>14 days ago</Mono>
-          <Mono size={10} color={C.primary}>Today</Mono>
-        </div>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 18 }}>
-        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, padding: 22 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 16 }}>Rarity Distribution</div>
-          {[["Legendary",3,25],["Epic",5,42],["Rare",3,25],["Common",2,17]].map(([r2,cnt,pct]) => {
-            const rm = RARITY[r2];
-            return (
-              <div key={r2} style={{ marginBottom: 13 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-                  <span style={{ fontSize: 11, color: rm.color, fontWeight: 600 }}>{rm.symbol} {r2}</span>
-                  <Mono size={10} color={C.muted}>{cnt} · {pct}%</Mono>
-                </div>
-                <div style={{ height: 5, background: C.card, borderRadius: 3, overflow: "hidden" }}>
-                  <div style={{ width: `${pct}%`, height: "100%", background: rm.color, borderRadius: 3 }} />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, padding: 22 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 16 }}>Top Sales</div>
-          {NFTS.filter((n) => n.listed).sort((a, b) => b.price - a.price).slice(0, 5).map((n, i) => (
-            <div key={n.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-              <Mono size={11} color={C.dim}>#{i + 1}</Mono>
-              <span style={{ fontSize: 18 }}>{n.img}</span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis" }}>{n.name}</div>
-              </div>
-              <BtcPrice value={n.price} size={12} />
-            </div>
-          ))}
-        </div>
-
-        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, padding: 22 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 16 }}>Epoch #927</div>
-          {[["Blocks","4635 → 4639"],["Confirmed","3/5"],["Difficulty","562.9T"],["Est. Reward","0.0144 BTC"],["APY","17.3%"]].map(([k, v]) => (
-            <div key={k} style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-              <span style={{ fontSize: 11, color: C.muted }}>{k}</span>
-              <Mono size={11} color={C.text}>{v}</Mono>
-            </div>
-          ))}
-          <div style={{ height: 5, background: C.card, borderRadius: 3, overflow: "hidden", marginTop: 12 }}>
-            <div style={{ width: "60%", height: "100%", background: `linear-gradient(90deg,${C.primary},${C.secondary})`, borderRadius: 3 }} />
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Footer ──────────────────────────────────────────────────────────────── */
-function Footer() {
-  const SOCIAL = [
-    { name: "Twitter / X", icon: "𝕏", handle: "@PoYMarket", url: "https://x.com/PoYMarket",       color: "#1DA1F2" },
-    { name: "Discord",     icon: "◈",  handle: "PoY Market", url: "https://discord.gg/poymarket",  color: "#5865F2" },
-    { name: "Telegram",    icon: "✈",  handle: "t.me/poymarket", url: "https://t.me/poymarket",   color: "#26A5E4" },
-    { name: "GitHub",      icon: "⌥",  handle: "poy-protocol",  url: "https://github.com/poy-protocol", color: C.muted },
-  ];
-
-  const LINKS = {
-    Marketplace: ["Explore NFTs", "Top Creators", "Upcoming Drops", "Auctions"],
-    Protocol:    ["Stake OP_20",  "Yield Mechanics", "OP_NET Epochs", "Mining Rewards"],
-    Resources:   ["Documentation", "API Reference", "SDK", "Bug Bounty"],
-    Company:     ["About", "Blog", "Careers", "Press Kit"],
-  };
-
-  return (
-    <footer style={{ background: C.surface, borderTop: `1px solid ${C.border}`, marginTop: 80, paddingBottom: "env(safe-area-inset-bottom)" }}>
-      {/* Main footer grid */}
-      <div style={{ maxWidth: 1320, margin: "0 auto", padding: "clamp(28px,5vw,60px) clamp(16px,3vw,32px) 32px", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "clamp(20px,3vw,40px)" }}>
-        {/* Brand */}
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 11, marginBottom: 16 }}>
-            <div style={{ width: 38, height: 38, borderRadius: 10, background: `linear-gradient(135deg, ${C.primary}, ${C.secondary})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, boxShadow: `0 4px 18px ${C.primary}44` }}>⚡</div>
-            <div>
-              <div style={{ fontSize: 16, fontWeight: 900, letterSpacing: "-0.03em", color: C.text }}>PoY<span style={{ color: C.primary }}>Market</span></div>
-              <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.2em", textTransform: "uppercase" }}>Bitcoin NFTs</div>
-            </div>
-          </div>
-          <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.8, maxWidth: 270, marginBottom: 8 }}>
-            The first Bitcoin-native NFT marketplace built on OP_NET. Every NFT is a Proof-of-Yield receipt — backed by real BTC stakes, earning mining rewards every epoch.
-          </p>
-          <p style={{ fontSize: 12, color: C.dim, lineHeight: 1.7, maxWidth: 270, marginBottom: 24 }}>
-            Non-custodial · Quantum-safe · Bitcoin L2
-          </p>
-
-          {/* Social links */}
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            {SOCIAL.map((s) => (
-              <a
-                key={s.name}
-                href={s.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                title={s.name}
-                style={{
-                  display: "flex", alignItems: "center", gap: 7,
-                  background: C.card, border: `1px solid ${C.border}`,
-                  borderRadius: 30, padding: "7px 14px",
-                  color: C.muted, fontSize: 12, fontWeight: 600,
-                  textDecoration: "none", transition: "all 0.2s",
-                  fontFamily: "inherit",
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.borderColor = s.color + "66";
-                  e.currentTarget.style.color = s.color;
-                  e.currentTarget.style.background = s.color + "0F";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.borderColor = C.border;
-                  e.currentTarget.style.color = C.muted;
-                  e.currentTarget.style.background = C.card;
-                }}
-              >
-                <span style={{ fontSize: 14 }}>{s.icon}</span>
-                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11 }}>{s.handle}</span>
-              </a>
-            ))}
-          </div>
-        </div>
-
-        {/* Link columns */}
-        {Object.entries(LINKS).map(([heading, links]) => (
-          <div key={heading}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: C.text, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>{heading}</div>
-            <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 10 }}>
-              {links.map((link) => (
-                <li key={link}>
-                  <a href="#" onClick={(e) => e.preventDefault()} style={{ fontSize: 13, color: C.muted, textDecoration: "none", transition: "color 0.2s" }}
-                    onMouseEnter={(e) => { e.currentTarget.style.color = C.text; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.color = C.muted; }}
-                  >{link}</a>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
-      </div>
-
-      {/* Bottom bar */}
-      <div style={{ borderTop: `1px solid ${C.border}` }}>
-        <div style={{ maxWidth: 1320, margin: "0 auto", padding: "16px clamp(16px,3vw,32px)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-          <Mono size={12} color={C.muted}>© 2026 PoYMarket. Built on OP_NET · Bitcoin Layer 2. All rights reserved.</Mono>
-          <div style={{ display: "flex", gap: 20 }}>
-            {["Privacy Policy", "Terms of Service", "Cookie Policy"].map((l) => (
-              <a key={l} href="#" onClick={(e) => e.preventDefault()} style={{ fontSize: 12, color: C.muted, textDecoration: "none" }}
-                onMouseEnter={(e) => { e.currentTarget.style.color = C.text; }}
-                onMouseLeave={(e) => { e.currentTarget.style.color = C.muted; }}
-              >{l}</a>
-            ))}
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.success, boxShadow: `0 0 6px ${C.success}` }} />
-            <Mono size={11} color={C.success}>All systems operational</Mono>
-          </div>
-        </div>
-      </div>
-    </footer>
-  );
-}
-
-/* ── Custom Cursor ───────────────────────────────────────────────────────── */
-function Cursor() {
-  const [dot,  setDot]  = useState({ x: -100, y: -100 });
-  const [ring, setRing] = useState({ x: -100, y: -100 });
-  const [down, setDown] = useState(false);
-  const dotRef  = useRef({ x: -100, y: -100 });
-  const ringRef = useRef({ x: -100, y: -100 });
-
-  useEffect(() => {
-    const onMove = (e) => { dotRef.current = { x: e.clientX, y: e.clientY }; };
-    const onDown = () => setDown(true);
-    const onUp   = () => setDown(false);
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("mouseup",   onUp);
-    let raf;
-    const loop = () => {
-      setDot({ ...dotRef.current });
-      ringRef.current = {
-        x: ringRef.current.x + (dotRef.current.x - ringRef.current.x) * 0.13,
-        y: ringRef.current.y + (dotRef.current.y - ringRef.current.y) * 0.13,
-      };
-      setRing({ ...ringRef.current });
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("mouseup",   onUp);
-      cancelAnimationFrame(raf);
-    };
-  }, []);
-
-  return (
-    <>
-      <div style={{ position: "fixed", left: dot.x - 5, top: dot.y - 5, width: 10, height: 10, borderRadius: "50%", background: C.primary, pointerEvents: "none", zIndex: 9999, transform: `scale(${down ? 0.5 : 1})`, transition: "transform 0.1s", mixBlendMode: "screen" }} />
-      <div style={{ position: "fixed", left: ring.x - 18, top: ring.y - 18, width: 36, height: 36, borderRadius: "50%", border: `1.5px solid ${C.primary}77`, pointerEvents: "none", zIndex: 9998 }} />
-    </>
-  );
-}
-
-/* ── Noise Overlay ───────────────────────────────────────────────────────── */
-function NoiseOverlay() {
-  return (
-    <svg style={{ position: "fixed", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 9990, opacity: 0.025 }}>
-      <filter id="fn"><feTurbulence type="fractalNoise" baseFrequency="0.75" numOctaves="4" stitchTiles="stitch" /><feColorMatrix type="saturate" values="0" /></filter>
-      <rect width="100%" height="100%" filter="url(#fn)" />
-    </svg>
-  );
-}
-
-/* ── Toast ───────────────────────────────────────────────────────────────── */
-function Toast({ toasts }) {
-  return (
-    <div style={{ position: "fixed", bottom: 28, right: 28, zIndex: 9999, display: "flex", flexDirection: "column", gap: 10 }}>
-      {toasts.map((t) => (
-        <div key={t.id} style={{ background: C.card, border: `1px solid ${t.type === "error" ? C.danger : C.primary}55`, borderRadius: 14, padding: "13px 18px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 12px 40px #00000077", animation: "mIn 0.3s ease" }}>
-          <span style={{ fontSize: 17 }}>{t.type === "error" ? "❌" : t.type === "warning" ? "⚠️" : "✅"}</span>
-          <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{t.msg}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ── Root App ────────────────────────────────────────────────────────────── */
-/* ── Faucet Tab — full testnet onboarding page ───────────────────────────── */
-function FaucetTab({ wallet, onOpenWallet, onMint }) {
-  const { isMobile } = useBreakpoint();
-
-  const STEPS = [
-    {
-      n: "01", icon: "⚡", title: "Install OP_WALLET",
-      color: "#FF9F1C",
-      desc: "The native Bitcoin OP_NET wallet. Supports Taproot addresses, MLDSA quantum-safe keys, and direct OP_NET smart contract interactions.",
-      links: [
-        { label: "Install from Chrome Web Store", url: "https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb" },
-      ],
-      tip: "Choose Taproot as your address type when creating your account — faucets and OP_NET contracts require a Taproot (bc1p…) address.",
-    },
-    {
-      n: "02", icon: "🚰", title: "Claim Free tBTC from Faucet",
-      color: "#00D68F",
-      desc: "Get 0.05 tBTC every 24 hours from the official OP_NET testnet faucet. No sign-up, no KYC — just paste your Taproot address.",
-      links: [
-        { label: "faucet.opnet.org — Official (0.05 tBTC/day)", url: "https://faucet.opnet.org/" },
-        { label: "opnet.org/points — Claim via Points page", url: "https://opnet.org/points" },
-      ],
-      tip: "Your wallet address starts with bc1p… (Taproot). Copy it from the top of OP_WALLET and paste into the faucet.",
-    },
-    {
-      n: "03", icon: "⛏", title: "Stake tBTC to Mint a Yield NFT",
-      color: "#7B2EDA",
-      desc: "Use your tBTC to mint a Proof-of-Yield NFT on PoYMarket. Pick a stake tier — higher stake = rarer NFT = higher yield APY.",
-      links: [],
-      tip: "After minting, your NFT will appear in the My NFTs tab once the OP_NET transaction is confirmed (usually 1–3 Bitcoin blocks).",
-      action: { label: "⚡ Mint a Yield NFT →", onClick: null /* set in render */ },
-    },
-    {
-      n: "04", icon: "🛒", title: "Buy an Existing Yield NFT",
-      color: "#4D9FFF",
-      desc: "Browse the marketplace and buy a listed Yield NFT using your tBTC. Click 'Buy Now' on any listed NFT — confirm the transaction in your wallet to complete the purchase instantly.",
-      links: [],
-      tip: "PoYMarket uses a single on-chain buy transaction — click Buy Now, confirm in your wallet, and the NFT transfers atomically. The contract verifies your payment and sends BTC to the seller instantly.",
-      action: { label: "🛒 Go to Marketplace →", onClick: null /* set in render */ },
-    },
-    {
-      n: "05", icon: "📈", title: "Earn Yield Every Epoch",
-      color: "#FF9F1C",
-      desc: "Once you hold a Yield NFT, your BTC rewards accumulate every OP_NET epoch (~10 minutes). Visit My NFTs and click Claim to withdraw your earned yield.",
-      links: [
-        { label: "OP_NET Explorer (OP_SCAN)", url: "https://scan.opnet.org/" },
-      ],
-      tip: "You can also trade your NFT on the marketplace at any time — accrued yield settles to your wallet before the transfer.",
-    },
-  ];
-
-  const RESOURCES = [
-    { icon: "📖", name: "OP_NET Docs",       url: "https://docs.opnet.org/",                    desc: "Developer docs and API reference" },
-    { icon: "🔍", name: "OP_SCAN Explorer",  url: "https://scan.opnet.org/",                   desc: "View transactions & contracts" },
-    { icon: "💬", name: "OP_NET Discord",     url: "https://discord.com/invite/opnet",           desc: "Community support & announcements" },
-    { icon: "🐦", name: "OP_NET Twitter/X",  url: "https://x.com/opnetbtc",                    desc: "Latest news and updates" },
-    { icon: "🔄", name: "MotoSwap",           url: "https://motoswap.org/",                     desc: "Swap & LP on OP_NET testnet" },
-    { icon: "🌾", name: "MotoChef Farm",      url: "https://farm.motoswap.org/",                desc: "Stake tBTC & earn rewards" },
-  ];
-
-  return (
-    <div style={{ maxWidth: 900, margin: "0 auto" }}>
-      {/* Header */}
-      <div style={{ textAlign: "center", marginBottom: 32, padding: "0 4px" }}>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: `${C.success}15`, border: `1px solid ${C.success}30`, borderRadius: 30, padding: "5px 16px", marginBottom: 14 }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: C.success, boxShadow: `0 0 8px ${C.success}` }} />
-          <span style={{ fontSize: 11, fontWeight: 700, color: C.success, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.1em" }}>TESTNET LIVE</span>
-        </div>
-        <h1 style={{ fontSize: isMobile ? 26 : 36, fontWeight: 900, letterSpacing: "-0.03em", color: C.text, margin: "0 0 12px", lineHeight: 1.1 }}>
-          Get Started on OP_NET Testnet
-        </h1>
-        <p style={{ fontSize: isMobile ? 13 : 15, color: C.muted, lineHeight: 1.7, maxWidth: 560, margin: "0 auto" }}>
-          PoYMarket runs on OP_NET Bitcoin testnet. Use free tBTC (test coins — no real value) to try staking, minting Yield NFTs, and buying from the marketplace.
-        </p>
-      </div>
-
-      {/* Main faucet CTA */}
-      <div style={{
-        borderRadius: 20, border: `1px solid ${C.primary}44`,
-        background: `linear-gradient(135deg, ${C.primary}10, ${C.secondary}08)`,
-        padding: isMobile ? "22px 18px" : "28px 32px",
-        marginBottom: 28, display: "flex",
-        flexDirection: isMobile ? "column" : "row",
-        alignItems: isMobile ? "flex-start" : "center",
-        gap: 20, position: "relative", overflow: "hidden",
-      }}>
-        <div style={{ position: "absolute", right: -30, top: -30, width: 160, height: 160, borderRadius: "50%", background: `${C.primary}08`, pointerEvents: "none" }} />
-        <div style={{ fontSize: 48, lineHeight: 1 }}>🚰</div>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: C.text, letterSpacing: "-0.02em", marginBottom: 6 }}>
-            Claim Your Free tBTC
-          </div>
-          <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, marginBottom: 14 }}>
-            Paste your Taproot address (starts with <span style={{ fontFamily: "'JetBrains Mono', monospace", color: C.accent }}>bc1p…</span>) into the faucet and get <strong style={{ color: C.text }}>0.05 tBTC</strong> instantly. Resets every 24 hours.
-          </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <a
-              href="https://faucet.opnet.org/" target="_blank" rel="noopener noreferrer"
-              style={{ display: "inline-flex", alignItems: "center", gap: 7, background: `linear-gradient(90deg, ${C.primary}, ${C.secondary})`, borderRadius: 30, padding: "11px 24px", color: "#fff", fontWeight: 800, fontSize: 14, textDecoration: "none", fontFamily: "inherit", boxShadow: `0 6px 22px ${C.primary}44` }}
-            >🚰 Go to Faucet</a>
-            <a
-              href="https://opnet.org/points" target="_blank" rel="noopener noreferrer"
-              style={{ display: "inline-flex", alignItems: "center", gap: 7, background: "transparent", border: `1px solid ${C.borderMid}`, borderRadius: 30, padding: "11px 20px", color: C.text, fontWeight: 600, fontSize: 14, textDecoration: "none", fontFamily: "inherit" }}
-            >🎯 Earn Bonus Points</a>
-          </div>
-        </div>
-        <div style={{ textAlign: isMobile ? "left" : "right", flexShrink: 0 }}>
-          <div style={{ fontSize: 32, fontWeight: 900, fontFamily: "'JetBrains Mono', monospace", color: C.primary }}>0.05</div>
-          <div style={{ fontSize: 11, color: C.muted }}>tBTC per day</div>
-          <div style={{ fontSize: 10, color: C.success, marginTop: 4 }}>● FREE · NO KYC</div>
-        </div>
-      </div>
-
-      {/* Step-by-step guide */}
-      <div style={{ marginBottom: 32 }}>
-        <div style={{ fontSize: 12, color: C.muted, fontWeight: 700, letterSpacing: "0.1em", marginBottom: 16 }}>STEP-BY-STEP GUIDE</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {STEPS.map((step) => (
-            <div key={step.n} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: isMobile ? "16px 16px" : "20px 24px", display: "flex", gap: 18, alignItems: "flex-start" }}>
-              {/* Number */}
-              <div style={{ width: 42, height: 42, borderRadius: 12, background: `${step.color}15`, border: `1px solid ${step.color}33`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                <div style={{ fontSize: 18, lineHeight: 1 }}>{step.icon}</div>
-                <div style={{ fontSize: 8, fontWeight: 800, color: step.color, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.04em" }}>{step.n}</div>
-              </div>
-              {/* Content */}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: isMobile ? 14 : 15, fontWeight: 800, color: C.text, marginBottom: 6 }}>{step.title}</div>
-                <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.65, marginBottom: step.links.length ? 10 : 0 }}>{step.desc}</div>
-                {step.links.map((l) => (
-                  <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer"
-                    style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, color: step.color, textDecoration: "none", fontWeight: 600, marginRight: 14, marginBottom: 6 }}
-                  >↗ {l.label}</a>
-                ))}
-                {step.action && (
-                  <button
-                    onClick={step.n === "03" ? onMint : () => {}}
-                    style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, color: step.color, background: `${step.color}15`, border: `1px solid ${step.color}33`, borderRadius: 20, padding: "5px 14px", cursor: "pointer", fontFamily: "inherit", fontWeight: 700, marginTop: 6 }}
-                  >{step.action.label}</button>
-                )}
-                {/* Pro tip */}
-                <div style={{ marginTop: 10, background: `${step.color}08`, border: `1px solid ${step.color}22`, borderRadius: 9, padding: "8px 12px", display: "flex", gap: 8, alignItems: "flex-start" }}>
-                  <span style={{ fontSize: 11, color: step.color, flexShrink: 0 }}>💡</span>
-                  <span style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>{step.tip}</span>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Resources grid */}
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ fontSize: 12, color: C.muted, fontWeight: 700, letterSpacing: "0.1em", marginBottom: 14 }}>USEFUL LINKS & RESOURCES</div>
-        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(3, 1fr)", gap: 10 }}>
-          {RESOURCES.map((r) => (
-            <a key={r.url} href={r.url} target="_blank" rel="noopener noreferrer"
-              style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 13, padding: "14px 16px", textDecoration: "none", display: "block", transition: "border-color 0.2s" }}
-              onMouseEnter={(e) => { e.currentTarget.style.borderColor = C.primary + "44"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.borderColor = C.border; }}
-            >
-              <div style={{ fontSize: 20, marginBottom: 7 }}>{r.icon}</div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 3 }}>{r.name}</div>
-              <div style={{ fontSize: 10, color: C.muted }}>{r.desc}</div>
-            </a>
-          ))}
-        </div>
-      </div>
-
-      {/* Testnet disclaimer */}
-      <div style={{ background: `${C.warning}0A`, border: `1px solid ${C.warning}33`, borderRadius: 14, padding: "14px 18px", display: "flex", gap: 12, alignItems: "flex-start" }}>
-        <span style={{ fontSize: 18, flexShrink: 0 }}>⚠️</span>
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.warning, marginBottom: 4 }}>Testnet Disclaimer</div>
-          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
-            tBTC (testnet Bitcoin) has <strong style={{ color: C.text }}>zero real-world value</strong> — it exists only for testing. PoYMarket is currently running on OP_NET Bitcoin testnet. All NFTs, yields, and transactions are for demonstration and testing purposes only. Do not send real mainnet BTC to any testnet address.
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export default function App() {
-  const { isMobile } = useBreakpoint();
-  const [tab,            setTab]           = useState("marketplace");
-  const [modal,          setModal]         = useState(null);
-  const [walletModal,    setWalletModal]   = useState(false);
-  const [mintModal,      setMintModal]     = useState(false);
-  const [wallet,         setWallet]        = useState(null);
-  const [toasts,         setToasts]        = useState([]);
-  const [recentlyViewed, setRecentlyViewed] = useState([]);
-  const toastId = useRef(0);
-
-  const addToast = useCallback((msg, type = "success") => {
-    const id = ++toastId.current;
-    setToasts((prev) => [...prev, { id, msg, type }]);
-    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
-  }, []);
-
-  const handleConnected = useCallback((info) => {
-    setWallet(info);
-    addToast(`${info.walletName} connected ✓`, "success");
-  }, [addToast]);
-
-  const handleDisconnect = useCallback(() => {
-    setWallet(null);
-    addToast("Wallet disconnected", "warning");
-  }, [addToast]);
-
-  const handleOpenNFT = useCallback((nft) => {
-    setModal(nft);
-    setRecentlyViewed((prev) => {
-      const filtered = prev.filter((n) => n.id !== nft.id);
-      return [nft, ...filtered].slice(0, 8);
-    });
-  }, []);
-
-  return (
-    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Outfit', sans-serif" }}>
-      <style>{`
-        ${FONTS}
-        *, *::before, *::after { box-sizing: border-box; }
-        body { margin: 0; overflow-x: hidden; }
-        input, select, button, textarea { font-family: inherit; }
-        input[type=number]::-webkit-inner-spin-button,
-        input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; }
-        ::placeholder { color: ${C.dim}; }
-        ::-webkit-scrollbar { width: 5px; height: 5px; }
-        ::-webkit-scrollbar-track { background: ${C.bg}; }
-        ::-webkit-scrollbar-thumb { background: #2A2A3E; border-radius: 3px; }
-        a { color: inherit; }
-        * { cursor: none !important; }
-        @keyframes mIn {
-          from { opacity: 0; transform: scale(0.94) translateY(8px); }
-          to   { opacity: 1; transform: scale(1)    translateY(0);   }
-        }
-        @keyframes slideUp {
-          from { opacity: 0; transform: translateY(20px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-        @keyframes spin {
-          from { transform: rotate(0deg);   }
-          to   { transform: rotate(360deg); }
-        }
-        @media (max-width: 639px) {
-          * { cursor: auto !important; }
-          .desktop-only { display: none !important; }
-        }
-        @media (min-width: 640px) {
-          .mobile-only { display: none !important; }
-        }
-        ${MOBILE_CSS}
-      `}</style>
-
-      {!isMobile && <NoiseOverlay />}
-      {!isMobile && <Cursor />}
-
-      {/* Ambient glow */}
-      <div style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0, background: `radial-gradient(ellipse 60% 40% at 12% 15%, ${C.primary}06, transparent 55%), radial-gradient(ellipse 50% 50% at 88% 85%, ${C.secondary}06, transparent 55%)` }} />
-
-      <div style={{ position: "relative", zIndex: 1 }}>
-        <LiveTicker />
-        <Nav
-          tab={tab}
-          setTab={setTab}
-          wallet={wallet}
-          onOpenWallet={() => setWalletModal(true)}
-          onDisconnect={handleDisconnect}
-        />
-
-        <main style={{ maxWidth: 1320, margin: "0 auto", padding: `clamp(16px,4vw,40px) clamp(12px,3vw,32px) ${isMobile ? "100px" : "60px"}` }}>
-          {tab === "marketplace" && <MarketTab onOpen={handleOpenNFT} recentlyViewed={recentlyViewed} onMint={() => setMintModal(true)} />}
-          {tab === "my-nfts"    && <MyNFTsTab wallet={wallet} onOpenWallet={() => setWalletModal(true)} onOpen={handleOpenNFT} onToast={addToast} />}
-          {tab === "activity"   && <ActivityTab />}
-          {tab === "analytics"  && <AnalyticsTab />}
-          {tab === "faucet"     && <FaucetTab wallet={wallet} onOpenWallet={() => setWalletModal(true)} onMint={() => setMintModal(true)} />}
-        </main>
-
-        <Footer />
-      </div>
+      </main>
 
       {/* Modals */}
-      {walletModal && (
-        <WalletModal
-          onClose={() => setWalletModal(false)}
-          onConnected={handleConnected}
-        />
-      )}
-      {modal && (
-        <NFTModal
-          nft={modal}
-          onClose={() => setModal(null)}
-          wallet={wallet}
-          onOpenWallet={() => { setModal(null); setWalletModal(true); }}
-          onToast={addToast}
-        />
-      )}
-      {mintModal && (
-        <MintModal
-          onClose={() => setMintModal(false)}
-          wallet={wallet}
-          onOpenWallet={() => { setMintModal(false); setWalletModal(true); }}
-          onToast={addToast}
-        />
+      {walletModal && <WalletModal onClose={() => setWalletModal(false)} onConnected={handleConnected} />}
+      {stakeModal && <StakeModal onClose={() => setStakeModal(false)} onSuccess={() => { setRefresh(x => x+1); showToast('CC staked successfully!'); }} />}
+      {detailNFT && <NFTDetailModal nft={detailNFT} onClose={() => setDetailNFT(null)} wallet={wallet} onAction={() => setRefresh(x => x+1)} />}
+
+      {/* Toast */}
+      {toast && (
+        <div style={{
+          position: 'fixed', bottom: 28, right: 28, zIndex: 3000,
+          background: toast.type === 'error' ? C.danger : C.success,
+          color: '#050811', borderRadius: 10, padding: '12px 20px',
+          fontSize: 13, fontWeight: 600, fontFamily: FONT.body,
+          boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+          animation: 'slideIn 0.25s ease',
+        }}>{toast.msg}</div>
       )}
 
-      <Toast toasts={toasts} />
-    </div>
+      {/* Footer */}
+      <footer style={{ borderTop: `1px solid ${C.border}`, padding: '20px 24px', marginTop: 48, textAlign: 'center' }}>
+        <div style={{ maxWidth: 1200, margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+          <Mono color={C.muted}>PoY Market — Canton Network · Demo/Showcase</Mono>
+          <div style={{ display: 'flex', gap: 16 }}>
+            <a href="https://cantonloop.com" target="_blank" rel="noreferrer" style={{ color: C.muted, fontSize: 12, textDecoration: 'none' }}>Canton Loop</a>
+            <a href="https://canton.network" target="_blank" rel="noreferrer" style={{ color: C.muted, fontSize: 12, textDecoration: 'none' }}>Canton Network</a>
+            <a href="https://docs.fivenorth.io/loop-sdk/overview/" target="_blank" rel="noreferrer" style={{ color: C.muted, fontSize: 12, textDecoration: 'none' }}>Loop SDK Docs</a>
+          </div>
+        </div>
+      </footer>
+    </>
   );
 }

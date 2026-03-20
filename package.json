@@ -1,12 +1,20 @@
 {
-  "name": "poy-market-api",
+  "name": "canton-poy-market",
   "version": "1.0.0",
-  "description": "PoYMarket backend API — keeps contract address server-side",
-  "main": "server.js",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev":   "node --watch server.js"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
   },
-  "engines": { "node": ">=18" },
-  "license": "MIT"
+  "dependencies": {
+    "@fivenorth/loop-sdk": "^0.8.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.2"
+  }
 }
